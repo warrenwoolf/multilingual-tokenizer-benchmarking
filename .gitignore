@@ -1,0 +1,74 @@
+# Secrets and tokens (keep the folder, ignore its contents)
+tokens/*
+!tokens/.gitkeep
+*.token
+*.key
+*.secret
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+*.egg-link
+.installed.cfg
+lib/
+lib64/
+MANIFEST
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data (downloaded datasets, large artifacts)
+data/
+*.bin
+*.model
+*.vocab
+*.jsonl.gz
+
+# Tokenizer artifacts
+artifacts/
+
+# Logs and outputs
+logs/
+*.log
+runs/
+wandb/
+mlruns/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
