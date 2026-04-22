@@ -17,7 +17,7 @@ def create_tokenizer_artifact(
 
     Args:
         corpus_path: Path to a plain-text corpus file (one sentence per line).
-        algorithm: One of SUPPORTED_ALGORITHMS ("bpe", "superbpe", "magnet").
+        algorithm: One of SUPPORTED_ALGORITHMS (e.g. "bpe", "superbpe", "wordpiece", "unigram", "byt5").
         vocab_size: Target vocabulary size.
         output_dir: Directory where the artifact will be saved.
         language: ISO 639-1 language code (used to name the artifact).
