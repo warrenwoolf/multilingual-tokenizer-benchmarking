@@ -19,8 +19,10 @@ from src.utils.tokenizer_algorithms import (
 )
 from tests.conftest import SAMPLE_STRINGS
 
-# SuperBPE is covered separately; ByT5 doesn't train but still conforms.
-CONTRACT_ALGORITHMS = [a for a in SUPPORTED_ALGORITHMS if a != "superbpe"]
+# SuperBPE needs an external repo + Rust; MorphBPE is a stub.
+# Both are covered (or stubbed) outside the parametrized contract suite.
+SKIP_IN_CONTRACT = {"superbpe", "morphbpe"}
+CONTRACT_ALGORITHMS = [a for a in SUPPORTED_ALGORITHMS if a not in SKIP_IN_CONTRACT]
 
 VOCAB_SIZE = 1000
 
@@ -166,3 +168,13 @@ def test_unk_handling(trained_tokenizer):
         # Either the rare codepoints map to <unk>, or the tokenizer
         # has byte-level fallback built in.
         assert len(ids) > 0
+
+
+# ---------- stubs ---------------------------------------------------------
+
+
+def test_morphbpe_is_explicit_stub(tiny_corpus, tmp_path):
+    """MorphBPE training raises a clear NotImplementedError pointing to the
+    official repo, instead of failing silently or producing a bogus artifact."""
+    with pytest.raises(NotImplementedError, match="llm-lab-org/MorphBPE"):
+        train_tokenizer(tiny_corpus, "morphbpe", 500, tmp_path / "x")

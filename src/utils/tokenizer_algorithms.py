@@ -4,6 +4,8 @@ Supported algorithms
 --------------------
 bpe        – standard Byte-Pair Encoding (Sennrich et al. 2016) via HF tokenizers
 superbpe   – SuperBPE two-stage training (Nut et al. 2025) via official scripts
+tiktoken   – tiktoken/GPT-style byte-level BPE (ByteLevel pre-tokenizer + BPE)
+morphbpe   – MorphBPE (Asgari et al. 2025); stub pending llm-lab-org integration
 wordpiece  – BERT-style WordPiece via HF tokenizers
 unigram    – Unigram LM / SentencePiece-style via HF tokenizers
 byt5       – Pure byte-level baseline via transformers.ByT5Tokenizer (no training)
@@ -31,7 +33,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_ALGORITHMS = ("bpe", "superbpe", "wordpiece", "unigram", "byt5")
+SUPPORTED_ALGORITHMS = (
+    "bpe",
+    "superbpe",
+    "tiktoken",
+    "morphbpe",
+    "wordpiece",
+    "unigram",
+    "byt5",
+)
 
 DEFAULT_SPECIAL_TOKENS = ["<pad>", "<unk>", "<s>", "</s>"]
 
@@ -186,6 +196,8 @@ def train_tokenizer(
     dispatch = {
         "bpe": _train_bpe,
         "superbpe": _train_superbpe,
+        "tiktoken": _train_tiktoken,
+        "morphbpe": _train_morphbpe,
         "wordpiece": _train_wordpiece,
         "unigram": _train_unigram,
         "byt5": _train_byt5,
@@ -241,6 +253,61 @@ def _train_unigram(corpus_path: Path, vocab_size: int, output_dir: Path) -> None
 def _train_byt5(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
     # No training — ByT5 is stateless. Persist a config marker so load works.
     ByT5Adapter().save(output_dir)
+
+
+def _train_tiktoken(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
+    """Train tiktoken-style byte-level BPE (GPT-2 / GPT-4 style).
+
+    `tiktoken` itself doesn't support production training, so we train
+    byte-level BPE via HuggingFace tokenizers (ByteLevel pre-tokenizer + BPE
+    model + ByteLevel decoder), which is the algorithm tiktoken implements.
+    The resulting tokenizer.json is a drop-in for HF and the merges can be
+    re-exported into tiktoken's mergeable_ranks format if needed.
+    """
+    from tokenizers import Tokenizer, decoders
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPre
+    from tokenizers.processors import ByteLevel as ByteLevelPost
+    from tokenizers.trainers import BpeTrainer
+
+    tok = Tokenizer(BPE())
+    tok.pre_tokenizer = ByteLevelPre(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    tok.post_processor = ByteLevelPost(trim_offsets=True)
+    # Byte-level BPE doesn't need <unk> (any byte sequence is encodable),
+    # but we still register the GPT-2-style end-of-text marker.
+    specials = ["<|endoftext|>", "<pad>", "<s>", "</s>"]
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=specials,
+        initial_alphabet=ByteLevelPre.alphabet(),
+    )
+    tok.train(files=[str(corpus_path)], trainer=trainer)
+    HFAdapter(tok, algorithm="tiktoken", special_tokens=specials, is_byte_level=True).save(output_dir)
+
+
+def _train_morphbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
+    """MorphBPE (Asgari et al. 2025) — STUB.
+
+    The official implementation lives at https://github.com/llm-lab-org/MorphBPE.
+    Integration is non-trivial because MorphBPE blocks BPE merges that cross
+    morpheme boundaries, which requires a per-language morpheme segmenter
+    (Morfessor for English / Turkish; Mandarin is super-analytic and lacks
+    the morphology MorphBPE was designed to exploit, so it should probably
+    be skipped for zh).
+
+    To wire this up, clone the repo (`make install-morphbpe` once added) and
+    set MORPHBPE_REPO; this stub will then shell out to its training entry
+    point and copy the resulting tokenizer.json into output_dir, like the
+    SuperBPE adapter.
+    """
+    raise NotImplementedError(
+        "MorphBPE adapter is a stub. To use it: clone "
+        "https://github.com/llm-lab-org/MorphBPE, configure a per-language "
+        "morpheme segmenter, and replace this body with a subprocess call "
+        "into the official training entry point. See REFERENCES.md for "
+        "details."
+    )
 
 
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
@@ -320,6 +387,8 @@ def load_tokenizer(artifact_dir: Path, algorithm: str):
     dispatch = {
         "bpe": _load_bpe,
         "superbpe": _load_superbpe,
+        "tiktoken": _load_tiktoken,
+        "morphbpe": _load_morphbpe,
         "wordpiece": _load_wordpiece,
         "unigram": _load_unigram,
         "byt5": _load_byt5,
@@ -351,6 +420,22 @@ def _load_unigram(artifact_dir: Path) -> HFAdapter:
 
 def _load_superbpe(artifact_dir: Path) -> HFAdapter:
     return _load_hf(artifact_dir, "superbpe")
+
+
+def _load_tiktoken(artifact_dir: Path) -> HFAdapter:
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(str(artifact_dir / _TOKENIZER_FILENAME))
+    return HFAdapter(
+        tok,
+        algorithm="tiktoken",
+        special_tokens=["<|endoftext|>", "<pad>", "<s>", "</s>"],
+        is_byte_level=True,
+    )
+
+
+def _load_morphbpe(artifact_dir: Path) -> HFAdapter:
+    return _load_hf(artifact_dir, "morphbpe")
 
 
 def _load_byt5(artifact_dir: Path) -> ByT5Adapter:

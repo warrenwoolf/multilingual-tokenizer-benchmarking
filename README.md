@@ -5,8 +5,8 @@ typology — measuring fertility, coverage, and split rate on FineWeb / FineWeb 
 
 ## Hypothesis
 
-**SuperBPE wins on analytic languages (English) and only ties BPE on synthetic
-languages (Russian, Hindi, Turkish).**
+**SuperBPE wins on analytic languages and only ties BPE on synthetic
+languages.**
 
 SuperBPE's key innovation is learning merges that cross whitespace (multi-word
 "superword" tokens). This pays off in analytic languages where whitespace
@@ -14,31 +14,47 @@ reliably separates semantic units, but should not help (and may hurt) in
 agglutinative or fusional languages where the interesting morphological
 structure lives *inside* words rather than across whitespace.
 
-## Algorithms (v1)
+## Algorithms
+
+v1 paper focus is on **BPE, SuperBPE, tiktoken-style byte-level BPE**, and
+(probably) **MorphBPE**. WordPiece, Unigram, and ByT5 are kept available as
+fallback / baselines.
 
 | | Algorithm | Source |
 |---|---|---|
 | 1 | BPE | `tokenizers.models.BPE` |
-| 2 | SuperBPE | [PythonNut/superbpe](https://github.com/PythonNut/superbpe) (shell-out) |
-| 3 | WordPiece | `tokenizers.models.WordPiece` |
-| 4 | Unigram | `tokenizers.models.Unigram` |
-| 5 | ByT5 (byte-level baseline) | `transformers.ByT5Tokenizer` |
+| 2 | SuperBPE | [PythonNut/superbpe](https://github.com/PythonNut/superbpe) (shell-out, opt-in) |
+| 3 | tiktoken-style BPE | byte-level BPE via `tokenizers` (GPT-2 / GPT-4 style) |
+| 4 | MorphBPE | [llm-lab-org/MorphBPE](https://github.com/llm-lab-org/MorphBPE) — stub, see notes |
+| 5 | WordPiece | `tokenizers.models.WordPiece` |
+| 6 | Unigram | `tokenizers.models.Unigram` |
+| 7 | ByT5 (byte-level baseline) | `transformers.ByT5Tokenizer` |
 
-Scoped out of v1 with reasons documented in [REFERENCES.md](REFERENCES.md):
-MAGNET (no public code; architecture-level), MorphBPE (thin official repo, time),
-byte-level BPE / tiktoken (can add later).
+Out of v1 with reasons documented in [REFERENCES.md](REFERENCES.md): MAGNET
+(architecture-level; no public code).
+
+**MorphBPE notes.** Adapter is a stub. Wiring it up requires (a) cloning the
+official repo, (b) per-language morpheme segmenters (Morfessor for English /
+Turkish; Mandarin is super-analytic and arguably out of scope for MorphBPE
+since it lacks the inflectional morphology MorphBPE was designed to exploit).
 
 ## Languages & Data
 
-| Code | Language  | Typology             | Source |
-|------|-----------|----------------------|--------|
-| en   | English   | Analytic             | `HuggingFaceFW/fineweb` (sample-10BT) |
-| ru   | Russian   | Fusional / synthetic | `HuggingFaceFW/fineweb-2` (`rus_Cyrl`) |
-| hi   | Hindi     | Fusional / synthetic | `HuggingFaceFW/fineweb-2` (`hin_Deva`) |
-| tr   | Turkish   | Agglutinative        | `HuggingFaceFW/fineweb-2` (`tur_Latn`) |
+| Code | Language | Typology         | Source |
+|------|----------|------------------|--------|
+| en   | English  | Analytic         | `HuggingFaceFW/fineweb` (sample-10BT) |
+| zh   | Mandarin | Super-analytic   | `HuggingFaceFW/fineweb-2` (`cmn_Hani`) |
+| tr   | Turkish  | Agglutinative    | `HuggingFaceFW/fineweb-2` (`tur_Latn`) |
+
+Russian (`ru` / `rus_Cyrl`) and Hindi (`hi` / `hin_Deva`) are kept configured
+in `LANGUAGE_CONFIGS` for ad-hoc use; they're just not in the default
+`LANGUAGES` list.
 
 FineWeb 2 deliberately excludes English (it was built from the non-English
 residual of the original FineWeb), so EN is drawn from the original FineWeb.
+FineWeb / FineWeb 2 are already deduplicated, so `download_language` writes
+``train.txt`` and ``eval.txt`` straight from the stream — no separate
+preparation pass.
 
 ## Metrics
 
@@ -50,70 +66,72 @@ Implemented in `src/utils/evaluation_metrics.py`:
 
 ## Quick start
 
+### Local
+
 ```bash
-# 1. Install deps (Python 3.11+; SuperBPE requires 3.12 and Rust — optional)
-make install
-
-# 2. Run the full test suite (offline; ~1.5s)
-make test
-
-# 3. Stream FineWeb data and prepare train/eval splits (writes to data/)
-python download_and_prepare.py --languages en,ru,hi,tr --byte-budget-mb 500
-
-# 4. Train every tokenizer (writes to artifacts/)
+make install            # python deps
+make test               # 173 contract tests, ~10s, no network
+python download_data.py # streams FineWeb(-2) for the configured languages
 python generate_tokenizers.py
-
-# 5. Evaluate (writes results.csv)
 python evaluate_tokenizers.py
+cat results.csv
 ```
 
-To enable SuperBPE:
+### Colab
+
+Paste [`colab.py`](colab.py) into a Google Colab cell and run.
+
+### Optional: enable SuperBPE
+
+Requires Python 3.12 and a Rust toolchain.
 
 ```bash
-# requires Python 3.12 and a Rust toolchain
 make install-superbpe
 export SUPERBPE_REPO=third_party/superbpe
-python generate_tokenizers.py --algorithms superbpe
+# then add "superbpe" to ALGORITHMS in generate_tokenizers.py
 ```
 
 ## Configuration
 
 All runtime config lives at the top of the three top-level scripts
-(`download_and_prepare.py`, `generate_tokenizers.py`, `evaluate_tokenizers.py`)
-as module-level Python — edit in place. Same values are overridable via CLI
-flags; see `--help` on each script.
+(`download_data.py`, `generate_tokenizers.py`, `evaluate_tokenizers.py`) as
+plain Python module-level constants. The actual orchestration logic
+(iteration, error handling, path management) lives in `src/tools/` so the
+top-level scripts stay short and readable — edit them in place to change a
+run.
 
 ## Repository layout
 
 ```
 .
-├── download_and_prepare.py      top-level: download + split
-├── generate_tokenizers.py       top-level: train tokenizers
-├── evaluate_tokenizers.py       top-level: compute metrics → results.csv
+├── colab.py                       paste-into-Colab one-cell quickstart
+├── download_data.py               top-level: config for streaming FineWeb(-2)
+├── generate_tokenizers.py         top-level: config for training
+├── evaluate_tokenizers.py         top-level: config for evaluating + CSV out
 ├── pyproject.toml
 ├── Makefile
-├── REFERENCES.md                paper + implementation citations
+├── REFERENCES.md                  paper + implementation citations
 ├── src/
 │   ├── prepare_data/
-│   │   ├── download_datasets.py   FineWeb streaming + byte budgeting
-│   │   └── prepare_datasets.py    clean / dedupe / shuffle / split
+│   │   └── download_datasets.py     FineWeb streaming + train/eval split
 │   ├── tools/
-│   │   ├── create_tokenizer.py    high-level: train one artifact
-│   │   └── evaluate_tokenizer.py  high-level: evaluate one artifact
+│   │   ├── download_data.py         iteration over LANGUAGES
+│   │   ├── create_tokenizer.py      single-shot + full sweep training
+│   │   └── evaluate_tokenizer.py    single-shot + full sweep + CSV
 │   └── utils/
-│       ├── tokenizer_algorithms.py 5 adapters (BPE, SuperBPE, WordPiece, Unigram, ByT5)
-│       └── evaluation_metrics.py   fertility, coverage, split rate
+│       ├── tokenizer_algorithms.py  7 adapters
+│       └── evaluation_metrics.py    fertility, coverage, split rate
 ├── tests/
-│   ├── conftest.py                 tiny multilingual corpus fixture
-│   ├── test_tokenizer_contract.py  contract tests run against every adapter
-│   ├── test_data_pipeline.py       offline tests for download + prepare
-│   └── test_evaluation_metrics.py  unit tests for the 3 metrics
-├── data/                           downloaded + prepared corpora (gitignored)
-└── artifacts/                      trained tokenizers (gitignored)
+│   ├── conftest.py                  tiny multilingual corpus fixture
+│   ├── test_tokenizer_contract.py   contract tests against every adapter
+│   ├── test_data_pipeline.py        offline tests for download
+│   └── test_evaluation_metrics.py   unit tests for the 3 metrics
+├── data/                            downloaded corpora (gitignored)
+└── artifacts/                       trained tokenizers (gitignored)
 ```
 
 ## Compute budget
 
-4 languages × 4 BPE-family algorithms × 4 vocab sizes × ~500 MB per language
-≈ 10–40 CPU-hours total. ByT5 is free. SuperBPE's stage-2 step is the slowest.
-Fits on a single 8-core VM overnight.
+3 languages × 3 BPE-family algorithms × 4 vocab sizes × ~500 MB per language
+≈ 5–20 CPU-hours. ByT5 is free. SuperBPE's stage-2 step is the slowest. Fits
+on a single 8-core VM in a few hours.
