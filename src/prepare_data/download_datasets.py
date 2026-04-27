@@ -20,6 +20,7 @@ byte-budget into eval.txt, sequentially.
 
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 
 LANGUAGE_CONFIGS: dict[str, dict] = {
@@ -103,6 +104,14 @@ def download_language(
                 break
             eval_fh.write(line)
             eval_written += n
+
+    # Explicitly release the Arrow reader and run GC to avoid SIGABRT when the
+    # iterator is abandoned mid-stream.  The datasets streaming backend holds
+    # C++ Arrow buffers via cyclic-reference chains that Python's reference
+    # counter alone cannot collect; without this, the C++ destructor fires
+    # during interpreter shutdown and calls std::terminate().
+    del stream
+    gc.collect()
 
     return {"train": train_path, "eval": eval_path}
 
