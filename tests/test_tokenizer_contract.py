@@ -39,7 +39,6 @@ def trained_tokenizer(request, tiny_corpus, tmp_path_factory):
         output_dir=out,
     )
     tok = load_tokenizer(out, algorithm=algo)
-    tok._artifact_dir = out
     return algo, tok
 
 

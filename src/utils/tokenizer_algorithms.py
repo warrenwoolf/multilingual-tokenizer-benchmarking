@@ -100,8 +100,6 @@ class HFAdapter:
         )
 
     def __getstate__(self) -> dict:
-        from tokenizers import Tokenizer  # local import; heavy
-
         return {
             "tokenizer_json": self.tokenizer.to_str(),
             "algorithm": self.algorithm,
