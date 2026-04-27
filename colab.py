@@ -1,4 +1,4 @@
-# Multilingual Tokenizer Benchmarking — Colab quickstart
+#@title Multilingual Tokenizer Benchmarking — Colab quickstart
 # ---------------------------------------------------------------------------
 # Paste this entire file into a Google Colab cell and run it. Uses Colab's
 # IPython-style ``!`` for shell commands, so it's not valid as a plain
