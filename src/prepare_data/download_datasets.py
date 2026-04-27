@@ -100,7 +100,11 @@ def download_language(
 
             # Train budget hit; fill eval.
             if eval_written + n > eval_budget:
-                break
+                # Stream doc sizes vary, so a single oversized doc shouldn't
+                # terminate the loop — skip it and let smaller later docs fit.
+                if eval_written >= eval_budget:
+                    break
+                continue
             eval_fh.write(line)
             eval_written += n
 

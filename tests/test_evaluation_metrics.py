@@ -81,6 +81,26 @@ def test_vocabulary_coverage_no_words_is_one():
     assert vocabulary_coverage(tok, []) == 1.0
 
 
+def test_vocabulary_coverage_byte_level_uses_encode_length():
+    """Byte-level vocabs encode words with prefixes (e.g. ``Ġhello``), so the
+    metric must use encode-length instead of raw vocab membership."""
+
+    class ByteLevelTokenizer:
+        is_byte_level = True
+
+        def encode(self, text: str) -> list[int]:
+            # "hi" encodes to one token; everything else to two.
+            return [0] if text == "hi" else [0, 1]
+
+        def get_vocab(self) -> dict:
+            # Byte-level vocab stores tokens as ``Ġhi``, not ``hi`` —
+            # raw membership would miss "hi" entirely.
+            return {"Ġhi": 0}
+
+    tok = ByteLevelTokenizer()
+    assert vocabulary_coverage(tok, ["hi world"]) == 0.5
+
+
 # ---------- pct_continued_words --------------------------------------------
 
 

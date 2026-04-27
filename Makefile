@@ -24,7 +24,7 @@ test:
 	$(PY) -m pytest tests/ -v
 
 download:
-	$(PY) download_and_prepare.py
+	$(PY) download_data.py
 
 train:
 	$(PY) generate_tokenizers.py
