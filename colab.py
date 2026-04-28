@@ -31,6 +31,15 @@ EVAL_BUDGET_MB = 5
 import os
 import sys
 
+# Inject HuggingFace token from Colab Secrets so datasets can access gated repos
+try:
+    from google.colab import userdata as _userdata
+    _hf_token = _userdata.get('HF_TOKEN')
+    if _hf_token:
+        os.environ['HF_TOKEN'] = _hf_token
+except Exception:
+    pass  # not running in Colab or secret not set
+
 # 1. Clone the repo
 if not os.path.isdir(REPO_DIR):
     !git clone --branch {BRANCH} {REPO_URL} {REPO_DIR}
