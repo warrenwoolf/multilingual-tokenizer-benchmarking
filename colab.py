@@ -22,7 +22,7 @@ BRANCH = "claude/setup-paper-codebase-aKac5"  # change to "main" after merge
 REPO_DIR = "multilingual-tokenizer-benchmarking"
 
 LANGUAGES = "en,zh,tr"
-ALGORITHMS = "bpe,tiktoken,wordpiece,unigram,byt5"  # SuperBPE/MorphBPE need extra setup
+ALGORITHMS = "bpe,tiktoken,morphbpe,wordpiece,unigram,byt5"  # SuperBPE needs extra setup
 VOCAB_SIZES = "8000,16000,32000"                    # 64000 added if budget permits
 TRAIN_BUDGET_MB = 100                               # ~100 MB per language for a quick run
 EVAL_BUDGET_MB = 5

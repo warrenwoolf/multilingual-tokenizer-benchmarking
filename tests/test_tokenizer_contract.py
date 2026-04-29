@@ -19,8 +19,10 @@ from src.utils.tokenizer_algorithms import (
 )
 from tests.conftest import SAMPLE_STRINGS
 
-# SuperBPE needs an external repo + Rust; MorphBPE is a stub.
-# Both are covered (or stubbed) outside the parametrized contract suite.
+# SuperBPE needs an external repo + Rust toolchain to train, so it stays
+# out of the parametrized contract. MorphBPE is per-language (it needs a
+# morpheme segmenter), so the multilingual fixture corpus doesn't fit; it
+# gets its own English-only contract block at the bottom of the file.
 SKIP_IN_CONTRACT = {"superbpe", "morphbpe"}
 CONTRACT_ALGORITHMS = [a for a in SUPPORTED_ALGORITHMS if a not in SKIP_IN_CONTRACT]
 
@@ -169,11 +171,81 @@ def test_unk_handling(trained_tokenizer):
         assert len(ids) > 0
 
 
-# ---------- stubs ---------------------------------------------------------
+# ---------- MorphBPE -------------------------------------------------------
+# MorphBPE is per-language, so it gets its own English-only contract block
+# rather than running over the multilingual fixture corpus.
 
 
-def test_morphbpe_is_explicit_stub(tiny_corpus, tmp_path):
-    """MorphBPE training raises a clear NotImplementedError pointing to the
-    official repo, instead of failing silently or producing a bogus artifact."""
-    with pytest.raises(NotImplementedError, match="llm-lab-org/MorphBPE"):
-        train_tokenizer(tiny_corpus, "morphbpe", 500, tmp_path / "x")
+ENGLISH_SENTENCES = [
+    "The quick brown fox jumps over the lazy dog near the riverbank.",
+    "She sells seashells by the seashore every summer afternoon before sunset.",
+    "Machine learning models tokenize text before training language representations.",
+    "Natural language processing requires careful attention to morphology and syntax.",
+    "Tokenizers split input text into subword units that the model can process.",
+    "Researchers compare algorithms across multiple languages and vocabulary sizes.",
+    "Effective benchmarks reveal systematic differences between tokenizer families.",
+    "A well-designed experiment controls for corpus size, vocabulary, and evaluation metric.",
+    "The unhappiness was overwhelming and discomfort was unbearable for everyone.",
+    "Running runners running quickly happily happiness sadness uncomfortable comfortable.",
+    "Tokenization tokenizer tokenized tokenizes preprocessing postprocessing reprocessing.",
+]
+
+
+@pytest.fixture(scope="module")
+def english_corpus(tmp_path_factory) -> Path:
+    path = tmp_path_factory.mktemp("en_corpus") / "train.txt"
+    path.write_text("\n".join(ENGLISH_SENTENCES * 300), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="module")
+def morphbpe_tokenizer(english_corpus, tmp_path_factory):
+    out = tmp_path_factory.mktemp("artifact_morphbpe")
+    train_tokenizer(
+        corpus_path=english_corpus,
+        algorithm="morphbpe",
+        vocab_size=VOCAB_SIZE,
+        output_dir=out,
+        language="en",
+    )
+    return load_tokenizer(out, algorithm="morphbpe")
+
+
+def test_morphbpe_vocab_within_budget(morphbpe_tokenizer):
+    assert morphbpe_tokenizer.vocab_size <= VOCAB_SIZE + 20
+    assert morphbpe_tokenizer.vocab_size >= len(morphbpe_tokenizer.special_tokens)
+
+
+def test_morphbpe_specials_present(morphbpe_tokenizer):
+    for sp in morphbpe_tokenizer.special_tokens:
+        assert sp in morphbpe_tokenizer.get_vocab()
+
+
+@pytest.mark.parametrize("text", ["happiness", "uncomfortable", "tokenization", "Hello, world!"])
+def test_morphbpe_roundtrip(morphbpe_tokenizer, text):
+    once = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(text))
+    twice = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(once))
+    assert once == twice
+
+
+def test_morphbpe_save_load_roundtrip(morphbpe_tokenizer, tmp_path):
+    path = tmp_path / "reloaded"
+    path.mkdir()
+    morphbpe_tokenizer.save(path)
+    reloaded = load_tokenizer(path, algorithm="morphbpe")
+    for s in ["happiness", "Hello, world!", "tokenization"]:
+        assert reloaded.encode(s) == morphbpe_tokenizer.encode(s)
+
+
+def test_morphbpe_requires_language(english_corpus, tmp_path):
+    """Calling train_tokenizer for morphbpe without a language is an error,
+    not a silent fallback to plain BPE."""
+    with pytest.raises(ValueError, match="language"):
+        train_tokenizer(english_corpus, "morphbpe", 500, tmp_path / "x")
+
+
+def test_morphbpe_rejects_unsupported_language(english_corpus, tmp_path):
+    """Mandarin lacks the inflectional morphology MorphBPE relies on, so
+    requesting it should fail loudly rather than silently degrade to BPE."""
+    with pytest.raises(NotImplementedError, match="zh"):
+        train_tokenizer(english_corpus, "morphbpe", 500, tmp_path / "x", language="zh")

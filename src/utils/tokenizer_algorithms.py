@@ -5,7 +5,8 @@ Supported algorithms
 bpe        – standard Byte-Pair Encoding (Sennrich et al. 2016) via HF tokenizers
 superbpe   – SuperBPE two-stage training (Nut et al. 2025) via official scripts
 tiktoken   – tiktoken/GPT-style byte-level BPE (ByteLevel pre-tokenizer + BPE)
-morphbpe   – MorphBPE (Asgari et al. 2025); stub pending llm-lab-org integration
+morphbpe   – MorphBPE (Asgari et al. 2025): morpheme-segment the corpus first,
+             then train standard BPE — see src/utils/morpheme_segmentation.py
 wordpiece  – BERT-style WordPiece via HF tokenizers
 unigram    – Unigram LM / SentencePiece-style via HF tokenizers
 byt5       – Pure byte-level baseline via transformers.ByT5Tokenizer (no training)
@@ -29,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -185,17 +187,30 @@ def train_tokenizer(
     algorithm: str,
     vocab_size: int,
     output_dir: Path,
+    language: str | None = None,
 ) -> None:
-    """Train a tokenizer and persist it to output_dir."""
+    """Train a tokenizer and persist it to output_dir.
+
+    ``language`` is required for algorithms that need a per-language asset
+    (currently only MorphBPE, which needs a morpheme segmenter); other
+    algorithms ignore it.
+    """
     if algorithm not in SUPPORTED_ALGORITHMS:
         raise ValueError(f"Unknown algorithm {algorithm!r}. Choose from {SUPPORTED_ALGORITHMS}")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if algorithm == "morphbpe":
+        if language is None:
+            raise ValueError(
+                "MorphBPE training requires a `language` argument so the "
+                "right morpheme segmenter can be selected."
+            )
+        _train_morphbpe(Path(corpus_path), vocab_size, output_dir, language)
+        return
     dispatch = {
         "bpe": _train_bpe,
         "superbpe": _train_superbpe,
         "tiktoken": _train_tiktoken,
-        "morphbpe": _train_morphbpe,
         "wordpiece": _train_wordpiece,
         "unigram": _train_unigram,
         "byt5": _train_byt5,
@@ -284,28 +299,43 @@ def _train_tiktoken(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
     HFAdapter(tok, algorithm="tiktoken", special_tokens=specials, is_byte_level=True).save(output_dir)
 
 
-def _train_morphbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
-    """MorphBPE (Asgari et al. 2025) — STUB.
+def _train_morphbpe(
+    corpus_path: Path, vocab_size: int, output_dir: Path, language: str
+) -> None:
+    """MorphBPE (Asgari et al. 2025).
 
-    The official implementation lives at https://github.com/llm-lab-org/MorphBPE.
-    Integration is non-trivial because MorphBPE blocks BPE merges that cross
-    morpheme boundaries, which requires a per-language morpheme segmenter
-    (Morfessor for English / Turkish; Mandarin is super-analytic and lacks
-    the morphology MorphBPE was designed to exploit, so it should probably
-    be skipped for zh).
+    The paper's Algorithm 1 is: initialize the vocabulary with characters,
+    morpheme-segment the corpus, then run BPE while skipping any candidate
+    pair that would cross a morpheme boundary. We implement that constraint
+    by morpheme-segmenting the corpus first (each word becomes its
+    whitespace-joined morphemes) and then training standard HF BPE on the
+    rewritten corpus. The Whitespace pre-tokenizer guarantees BPE never
+    counts or merges a pair across a morpheme boundary, so it's equivalent.
 
-    To wire this up, clone the repo (`make install-morphbpe` once added) and
-    set MORPHBPE_REPO; this stub will then shell out to its training entry
-    point and copy the resulting tokenizer.json into output_dir, like the
-    SuperBPE adapter.
+    See src/utils/morpheme_segmentation.py for the per-language segmenter.
+    The official llm-lab-org/MorphBPE repo was an empty placeholder at the
+    time of writing, so this is a from-scratch implementation of the
+    paper's algorithm rather than a wrapper around official code.
     """
-    raise NotImplementedError(
-        "MorphBPE adapter is a stub. To use it: clone "
-        "https://github.com/llm-lab-org/MorphBPE, configure a per-language "
-        "morpheme segmenter, and replace this body with a subprocess call "
-        "into the official training entry point. See REFERENCES.md for "
-        "details."
-    )
+    from tokenizers import Tokenizer, decoders
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.trainers import BpeTrainer
+
+    from src.utils.morpheme_segmentation import segment_corpus
+
+    with tempfile.TemporaryDirectory(prefix="morphbpe_") as td:
+        segmented = Path(td) / "segmented.txt"
+        segment_corpus(corpus_path, segmented, language=language)
+
+        tok = Tokenizer(BPE(unk_token="<unk>"))
+        tok.pre_tokenizer = Whitespace()
+        tok.decoder = decoders.BPEDecoder()
+        trainer = BpeTrainer(
+            vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS
+        )
+        tok.train(files=[str(segmented)], trainer=trainer)
+        HFAdapter(tok, algorithm="morphbpe").save(output_dir)
 
 
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
