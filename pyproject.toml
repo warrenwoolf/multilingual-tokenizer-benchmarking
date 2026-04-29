@@ -23,6 +23,11 @@ dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",
 ]
+# Downstream LLM-perplexity evaluation (train_llms.py). Heavy dep, opt-in.
+llm = [
+    "torch>=2.1",
+    "numpy>=1.24",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

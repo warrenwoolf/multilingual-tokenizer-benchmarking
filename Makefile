@@ -1,10 +1,14 @@
-.PHONY: install install-superbpe test download train evaluate all clean
+.PHONY: install install-llm install-superbpe test download train evaluate train-llms all clean
 
 PY ?= python3
 SUPERBPE_REPO ?= third_party/superbpe
 
 install:
 	$(PY) -m pip install -e ".[dev]"
+
+# Pulls torch + numpy for the downstream LLM perplexity evaluation.
+install-llm:
+	$(PY) -m pip install -e ".[llm]"
 
 # SuperBPE needs Python 3.12, a Rust toolchain, and the patched tokenizers fork.
 # This target clones the official repo under third_party/ and builds its deps.
@@ -32,7 +36,10 @@ train:
 evaluate:
 	$(PY) evaluate_tokenizers.py
 
+train-llms:
+	$(PY) train_llms.py
+
 all: download train evaluate
 
 clean:
-	rm -rf data/ artifacts/ results.csv .pytest_cache/ **/__pycache__
+	rm -rf data/ artifacts/ results.csv llm_results.csv .pytest_cache/ **/__pycache__

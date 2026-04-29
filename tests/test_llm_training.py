@@ -1,0 +1,137 @@
+"""Smoke tests for the small-LM downstream tokenizer evaluation.
+
+These tests train a tiny LM (a few thousand parameters, a handful of steps)
+on the multilingual fixture corpus, just to assert the train + perplexity
+pipeline runs end-to-end and produces sane numbers.
+
+Skipped when torch is not installed — the LLM eval is an optional extra.
+"""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import pytest
+
+torch = pytest.importorskip("torch")  # whole module is gated on torch availability
+
+from src.utils.llm_training import (
+    LLMConfig,
+    count_parameters,
+    evaluate_perplexity,
+    tokenize_corpus,
+    train_and_evaluate,
+    train_lm,
+)
+from src.utils.tokenizer_algorithms import load_tokenizer, train_tokenizer
+
+
+TINY_VOCAB = 512
+TINY_CONFIG = LLMConfig(
+    d_model=64,
+    n_layers=2,
+    n_heads=4,
+    d_ff=128,
+    ctx_len=32,
+    train_tokens=20_000,   # tiny: a few dozen steps
+    batch_size=8,
+    warmup_steps=5,
+    learning_rate=1e-3,
+    seed=0,
+    device="cpu",
+    dtype="fp32",
+)
+
+
+@pytest.fixture(scope="module")
+def trained_bpe(tiny_corpus, tmp_path_factory):
+    out = tmp_path_factory.mktemp("bpe_artifact")
+    train_tokenizer(
+        corpus_path=tiny_corpus,
+        algorithm="bpe",
+        vocab_size=TINY_VOCAB,
+        output_dir=out,
+    )
+    return load_tokenizer(out, algorithm="bpe")
+
+
+def test_tokenize_corpus_respects_max_tokens(tiny_corpus, trained_bpe):
+    arr = tokenize_corpus(trained_bpe, tiny_corpus, max_tokens=1000)
+    assert arr.dtype.name == "int32"
+    assert 0 < arr.shape[0] <= 1000
+
+
+def test_tokenize_corpus_full_pass(tiny_corpus, trained_bpe):
+    arr = tokenize_corpus(trained_bpe, tiny_corpus, max_tokens=None)
+    # Tiny corpus is ~26 lines × 200 repeats; should yield way more than ctx_len.
+    assert arr.shape[0] > TINY_CONFIG.ctx_len * 10
+
+
+def test_train_lm_runs_and_reduces_loss(tiny_corpus, trained_bpe, capsys):
+    """Train a tiny model for a handful of steps; assert no crash and finite loss."""
+    losses: list[float] = []
+
+    def capture(msg):
+        # Capture per-step lines like "    step 1/N  loss=4.12  lr=...".
+        if "loss=" in msg:
+            try:
+                losses.append(float(msg.split("loss=")[1].split()[0]))
+            except (IndexError, ValueError):
+                pass
+
+    model, device, amp_dtype, train_seconds = train_lm(
+        trained_bpe, tiny_corpus, TINY_CONFIG, log_fn=capture
+    )
+    assert train_seconds >= 0
+    assert losses, "expected at least one logged loss"
+    assert all(math.isfinite(l) for l in losses)
+    # Sanity: parameter count is in the right ballpark for the tiny config.
+    n = count_parameters(model)
+    assert 10_000 < n < 5_000_000
+
+
+def test_train_and_evaluate_returns_finite_metrics(tiny_corpus, trained_bpe):
+    metrics = train_and_evaluate(
+        tokenizer=trained_bpe,
+        train_corpus_path=tiny_corpus,
+        eval_corpus_path=tiny_corpus,  # same fixture for the smoke test
+        cfg=TINY_CONFIG,
+        log_fn=lambda *a, **k: None,
+    )
+    assert math.isfinite(metrics["perplexity"])
+    assert metrics["perplexity"] > 1.0  # PPL is bounded below by 1
+    assert math.isfinite(metrics["bits_per_byte"])
+    assert metrics["bits_per_byte"] > 0
+    assert metrics["param_count"] > 0
+    assert metrics["eval_tokens_scored"] > 0
+
+
+def test_perplexity_matches_exp_of_mean_nll(tiny_corpus, trained_bpe):
+    """exp(mean_nll_per_token) must equal perplexity (sanity check for BPB)."""
+    model, device, amp_dtype, _ = train_lm(
+        trained_bpe, tiny_corpus, TINY_CONFIG, log_fn=lambda *a, **k: None
+    )
+    metrics = evaluate_perplexity(
+        model=model,
+        tokenizer=trained_bpe,
+        eval_corpus_path=tiny_corpus,
+        cfg=TINY_CONFIG,
+        device=device,
+        amp_dtype=amp_dtype,
+        log_fn=lambda *a, **k: None,
+    )
+    assert math.isclose(
+        metrics["perplexity"],
+        math.exp(metrics["mean_nll_per_token"]),
+        rel_tol=1e-6,
+    )
+
+
+def test_tiny_corpus_too_small_raises(tmp_path, trained_bpe):
+    """Token streams shorter than ctx_len+2 should error clearly."""
+    short = tmp_path / "short.txt"
+    short.write_text("hi", encoding="utf-8")
+    cfg = LLMConfig(**{**vars(TINY_CONFIG), "ctx_len": 64})
+    with pytest.raises(RuntimeError, match="Train corpus only produced"):
+        train_lm(trained_bpe, short, cfg, log_fn=lambda *a, **k: None)
