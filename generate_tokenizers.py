@@ -12,7 +12,10 @@ from src.tools.create_tokenizer import generate_all_tokenizers
 # v1 paper focus: BPE, SuperBPE, tiktoken-style, and (probably) MorphBPE.
 # WordPiece / Unigram / ByT5 are kept available as fallback / baselines.
 LANGUAGES = ["en", "zh", "tr"]
-ALGORITHMS = ["bpe", "superbpe", "tiktoken"]  # add "morphbpe" once stub is wired
+ALGORITHMS = ["bpe", "superbpe", "tiktoken", "morphbpe"]
+# MorphBPE only runs for languages with a configured morpheme segmenter
+# (currently {"en", "tr"}). Mandarin is super-analytic and out of scope —
+# (zh, morphbpe) is filtered automatically by ``iter_jobs``.
 VOCAB_SIZES = [8_000, 16_000, 32_000, 64_000]
 DATA_DIR = Path("data")
 ARTIFACT_DIR = Path("artifacts")
