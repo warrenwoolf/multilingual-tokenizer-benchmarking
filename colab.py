@@ -24,8 +24,8 @@ REPO_DIR = "multilingual-tokenizer-benchmarking"
 LANGUAGES = "en,zh,tr"
 ALGORITHMS = "bpe,tiktoken,morphbpe,wordpiece,unigram,byt5"  # SuperBPE needs extra setup
 VOCAB_SIZES = "8000,16000,32000"                    # 64000 added if budget permits
-TRAIN_BUDGET_MB = 100                               # ~100 MB per language for a quick run
-EVAL_BUDGET_MB = 5
+MAX_TRAIN_ROWS = 100_000                            # rows per language for a quick run
+MAX_EVAL_ROWS = 5_000
 # ===========================================================================
 
 import os
@@ -62,8 +62,8 @@ from src.tools.download_data import download_all_languages
 download_all_languages(
     languages={LANGUAGES.split(',')!r},
     data_dir='data',
-    train_budget_mb={TRAIN_BUDGET_MB},
-    eval_budget_mb={EVAL_BUDGET_MB},
+    max_train_rows={MAX_TRAIN_ROWS},
+    max_eval_rows={MAX_EVAL_ROWS},
 )
 
 # --- train ---
