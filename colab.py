@@ -36,8 +36,10 @@ if not os.path.isdir(REPO_DIR):
     !git clone --branch {BRANCH} {REPO_URL} {REPO_DIR}
 %cd {REPO_DIR}
 
-# 2. Install dependencies (editable so any tweaks take effect immediately)
-!pip install -q -e .
+# 2. Install dependencies (editable so any tweaks take effect immediately).
+#    morfessor is pulled in transitively via pyproject.toml, but listing it
+#    explicitly here makes the MorphBPE dependency obvious.
+!pip install -q -e . morfessor
 
 # 3. Override the per-script config via env-var-friendly Python overrides.
 #    Each script is config-only at the top, so a tiny shim keeps the run
