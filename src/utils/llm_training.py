@@ -5,25 +5,37 @@ with each candidate tokenizer, then measure how well it predicts held-out text.
 The intent is to predict (cheaply) which tokenizer would win in a much larger
 training run.
 
+Each LM is **monolingual**: it's trained on a single language's corpus with
+a tokenizer that was itself trained on that same language. The artifact-naming
+scheme (``{lang}_{algo}_v{vocab}``) enforces this — there's no cross-language
+mixing in the training pipeline.
+
 Cross-tokenizer comparison
 --------------------------
 Per-token perplexity is *not* comparable across different tokenizers, because
 each tokenizer defines a different distribution support and segments the same
-text into a different number of tokens. We therefore also report
-**bits-per-byte (BPB)**: total cross-entropy on the eval set, normalized by
-the raw UTF-8 byte count of that eval set. BPB is invariant to the tokenizer
-choice and is the standard fair-comparison metric (Gao et al., MEGA, etc.).
+text into a different number of tokens. We report
+**bits-per-byte (BPB)** instead: total cross-entropy on the eval set,
+normalized by the raw UTF-8 byte count of that eval set. BPB is invariant to
+the tokenizer choice and is the standard fair-comparison metric.
 
     bpb = (sum_ce_nats / total_eval_bytes) / ln(2)
 
+Two eval sets
+-------------
+1. **In-domain held-out** — ``data/{lang}/eval.txt`` from the same FineWeb
+   distribution as training.
+2. **FLORES-200 devtest** — out-of-distribution generalization benchmark
+   (clean, professionally translated). Loaded on demand; see ``FLORES_CONFIGS``.
+
 Compute budget
 --------------
-We follow the user spec and fix the **training-token budget** (e.g. 50M tokens)
-across all tokenizers. This is intentionally imperfect: a tokenizer with high
-fertility sees less *content* for the same token count, and a tokenizer with
-larger vocab has a bigger embedding table (so more parameters and FLOPs per
-token). We document this caveat rather than try to fix it. In a fairer setup
-you'd fix wall-clock or training-FLOPs; here we trade rigor for reproducibility.
+We follow the user spec and fix the **training-token budget** across all
+tokenizers (default 1B, ~Chinchilla-optimal for 50M params). This is
+intentionally imperfect: a tokenizer with high fertility sees less *content*
+for the same token count, and a tokenizer with larger vocab has a bigger
+embedding table (so more parameters and FLOPs per token). We document this
+caveat rather than try to fix it.
 
 Architecture
 ------------
@@ -36,15 +48,34 @@ Plain pre-LN decoder-only transformer (GPT-2 style):
 Default size: d_model=512, n_layers=8, n_heads=8, d_ff=2048, ctx_len=512.
 Total params depend on vocab size (the embedding table dominates):
     vocab=8k  -> ~30M    vocab=32k -> ~42M    vocab=64k -> ~58M
+
+Wall-clock estimate: A100 40GB at ~250K tok/s bf16 -> ~65 min per 1B-token run.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Iterator
+
+
+# ---------------------------------------------------------------------------
+# FLORES-200 language code map
+# ---------------------------------------------------------------------------
+# Maps our internal codes to FLORES-200 ``{iso639-3}_{script}`` configs.
+# Mandarin: FineWeb 2 uses ``cmn_Hani`` (script-agnostic); FLORES-200 distinguishes
+# Simplified (zho_Hans) and Traditional (zho_Hant). zho_Hans is the closer match.
+
+FLORES_CONFIGS: dict[str, str] = {
+    "en": "eng_Latn",
+    "zh": "zho_Hans",
+    "tr": "tur_Latn",
+    "ru": "rus_Cyrl",
+    "hi": "hin_Deva",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -56,8 +87,9 @@ from typing import Iterator
 class LLMConfig:
     """Architecture + training hyperparameters.
 
-    Defaults target ~50M params at 32k vocab and run in well under an hour
-    on a single modern GPU. Override for smoke tests or bigger sweeps.
+    Defaults target ~50M params at 32k vocab. The default 1B-token budget
+    is Chinchilla-optimal for that size and runs in roughly an hour on a
+    single A100 40GB. Override for smoke tests or bigger sweeps.
     """
 
     # Architecture
@@ -69,7 +101,7 @@ class LLMConfig:
     dropout: float = 0.0
 
     # Training
-    train_tokens: int = 50_000_000  # fixed token budget (per user spec)
+    train_tokens: int = 1_000_000_000  # ~Chinchilla-optimal for 50M params
     batch_size: int = 32
     learning_rate: float = 3e-4
     min_lr: float = 3e-5
@@ -84,6 +116,32 @@ class LLMConfig:
     seed: int = 0
     device: str = "auto"  # "auto" -> cuda if available else cpu
     dtype: str = "auto"  # "auto" -> bf16 on CUDA else fp32
+    log_every: int = 50   # step interval for stdout + wandb training-loss logging
+
+    # Weights & Biases (optional). When ``wandb_project`` is None, no W&B
+    # calls are made and wandb is not imported.
+    wandb_project: str | None = None
+    wandb_entity: str | None = None
+    wandb_run_name: str | None = None  # filled in by orchestrator per artifact
+    wandb_tags: list[str] = field(default_factory=list)
+
+
+# Where to look for a W&B API key on disk if WANDB_API_KEY is not set.
+WANDB_TOKEN_PATH = Path("tokens") / "wandb.token"
+
+
+def _ensure_wandb_login() -> None:
+    """If WANDB_API_KEY is unset, populate it from ``tokens/wandb.token``.
+
+    Falls through silently if neither is available — wandb.init will then
+    prompt or fail, depending on its mode setting.
+    """
+    if os.environ.get("WANDB_API_KEY"):
+        return
+    if WANDB_TOKEN_PATH.exists():
+        key = WANDB_TOKEN_PATH.read_text(encoding="utf-8").strip()
+        if key:
+            os.environ["WANDB_API_KEY"] = key
 
 
 def resolve_device(spec: str):
@@ -288,15 +346,37 @@ def _sample_batch(token_array, batch_size: int, ctx_len: int, generator):
     return x, y
 
 
+def _init_wandb(cfg: LLMConfig, extra_config: dict | None = None):
+    """Start a wandb run if cfg.wandb_project is set; otherwise return None."""
+    if not cfg.wandb_project:
+        return None
+    _ensure_wandb_login()
+    import wandb
+
+    init_config = asdict(cfg)
+    if extra_config:
+        init_config.update(extra_config)
+    return wandb.init(
+        project=cfg.wandb_project,
+        entity=cfg.wandb_entity,
+        name=cfg.wandb_run_name,
+        tags=cfg.wandb_tags or None,
+        config=init_config,
+        reinit=True,
+    )
+
+
 def train_lm(
     tokenizer,
     train_corpus_path: Path,
     cfg: LLMConfig,
     log_fn=print,
+    wandb_run=None,
 ):
     """Train a GPT on tokenized ``train_corpus_path`` for cfg.train_tokens tokens.
 
-    Returns the trained model + the device + the autocast dtype.
+    Returns the trained model + the device + the autocast dtype + train wall time.
+    Logs per-step ``train/loss`` and ``train/lr`` to ``wandb_run`` if provided.
     """
     import numpy as np
     import torch
@@ -324,7 +404,12 @@ def train_lm(
 
     vocab_size = tokenizer.vocab_size
     model = _build_model(vocab_size, cfg).to(device)
-    log_fn(f"  model: vocab={vocab_size:,} params={count_parameters(model):,}")
+    n_params = count_parameters(model)
+    log_fn(f"  model: vocab={vocab_size:,} params={n_params:,}")
+    if wandb_run is not None:
+        wandb_run.summary["param_count"] = n_params
+        wandb_run.summary["vocab_size"] = vocab_size
+        wandb_run.summary["train_tokens_actual"] = int(train_ids.shape[0])
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -340,6 +425,7 @@ def train_lm(
     gen = torch.Generator().manual_seed(cfg.seed)
     model.train()
     t_start = time.time()
+    stdout_every = max(1, total_steps // 20)
     for step in range(total_steps):
         lr = _lr_at_step(step, total_steps, cfg)
         for g in optimizer.param_groups:
@@ -357,11 +443,24 @@ def train_lm(
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
-        if step == 0 or (step + 1) % max(1, total_steps // 10) == 0 or step == total_steps - 1:
-            log_fn(f"    step {step + 1:>5}/{total_steps}  loss={loss.item():.4f}  lr={lr:.2e}")
+
+        loss_val = loss.item()
+        if wandb_run is not None and (step % cfg.log_every == 0 or step == total_steps - 1):
+            wandb_run.log(
+                {
+                    "train/loss": loss_val,
+                    "train/lr": lr,
+                    "train/tokens_seen": (step + 1) * tokens_per_step,
+                },
+                step=step,
+            )
+        if step == 0 or (step + 1) % stdout_every == 0 or step == total_steps - 1:
+            log_fn(f"    step {step + 1:>5}/{total_steps}  loss={loss_val:.4f}  lr={lr:.2e}")
 
     train_seconds = time.time() - t_start
     log_fn(f"  trained in {train_seconds:.1f}s")
+    if wandb_run is not None:
+        wandb_run.summary["train_seconds"] = train_seconds
     return model, device, amp_dtype, train_seconds
 
 
@@ -370,37 +469,25 @@ def train_lm(
 # ---------------------------------------------------------------------------
 
 
-def evaluate_perplexity(
-    model,
-    tokenizer,
-    eval_corpus_path: Path,
-    cfg: LLMConfig,
-    device,
-    amp_dtype,
-    log_fn=print,
-) -> dict:
-    """Compute per-token perplexity and bits-per-byte on ``eval_corpus_path``.
+def _score_ids(model, eval_ids, total_bytes: int, cfg: LLMConfig, device, amp_dtype) -> dict:
+    """Score a 1-D token id array under ``model`` and return PPL/BPB metrics.
 
-    Bits-per-byte (BPB) is the cross-tokenizer-comparable metric. It uses the
-    raw UTF-8 byte count of the eval text in the denominator — independent of
-    how the tokenizer chose to segment it.
+    ``total_bytes`` is the raw UTF-8 byte count of the source text; we use it
+    to normalize cross-entropy into bits-per-byte (the cross-tokenizer-
+    comparable metric). If we drop a tail of < ctx_len ids that don't fill a
+    final window, we scale the byte count proportionally so BPB remains a
+    per-byte-of-scored-text quantity.
     """
     import torch
 
-    eval_ids = tokenize_corpus(tokenizer, eval_corpus_path, max_tokens=None)
-    eval_bytes = eval_corpus_path.stat().st_size  # raw UTF-8 byte count
-    log_fn(f"  eval: {eval_ids.shape[0]:,} tokens, {eval_bytes:,} bytes")
-
     if eval_ids.shape[0] < 2:
-        raise RuntimeError("Eval corpus has fewer than 2 tokens; cannot compute perplexity.")
+        raise RuntimeError("Need at least 2 tokens to compute perplexity.")
 
-    model.eval()
     ctx = cfg.ctx_len
+    model.eval()
     total_loss_sum = 0.0
     total_targets = 0
     with torch.no_grad():
-        # Non-overlapping windows of length ctx+1 (last token shifts to target).
-        # Simple, fast, and within ~5% of sliding-window PPL for ctx=512.
         i = 0
         while i + ctx + 1 <= eval_ids.shape[0]:
             window = torch.from_numpy(eval_ids[i : i + ctx + 1]).long().unsqueeze(0).to(device)
@@ -418,18 +505,14 @@ def evaluate_perplexity(
 
     if total_targets == 0:
         raise RuntimeError(
-            f"Eval corpus too short for one full window of ctx_len={ctx}."
+            f"Eval data too short for even one window of ctx_len={ctx}."
         )
 
     mean_nll_per_token = total_loss_sum / total_targets
     perplexity = math.exp(mean_nll_per_token)
 
-    # BPB: total CE in nats / total eval bytes / ln(2).
-    # We score `total_targets` tokens, but the eval file may contain more bytes
-    # than those tokens cover (we drop a tail < ctx). Scale eval_bytes to the
-    # fraction of tokens we actually scored so BPB is per-byte-of-scored-text.
     fraction_scored = total_targets / max(1, eval_ids.shape[0] - 1)
-    scored_bytes = eval_bytes * fraction_scored
+    scored_bytes = total_bytes * fraction_scored
     bits_per_byte = (total_loss_sum / scored_bytes) / math.log(2) if scored_bytes > 0 else float("nan")
 
     return {
@@ -439,6 +522,73 @@ def evaluate_perplexity(
         "eval_tokens_scored": total_targets,
         "eval_bytes_scored": scored_bytes,
     }
+
+
+def evaluate_perplexity(
+    model,
+    tokenizer,
+    eval_corpus_path: Path,
+    cfg: LLMConfig,
+    device,
+    amp_dtype,
+    log_fn=print,
+) -> dict:
+    """Compute per-token perplexity and bits-per-byte on ``eval_corpus_path``."""
+    eval_ids = tokenize_corpus(tokenizer, eval_corpus_path, max_tokens=None)
+    eval_bytes = Path(eval_corpus_path).stat().st_size
+    log_fn(f"  eval (test set): {eval_ids.shape[0]:,} tokens, {eval_bytes:,} bytes")
+    return _score_ids(model, eval_ids, eval_bytes, cfg, device, amp_dtype)
+
+
+def evaluate_perplexity_on_sentences(
+    model,
+    tokenizer,
+    sentences: list[str],
+    cfg: LLMConfig,
+    device,
+    amp_dtype,
+    label: str = "sentences",
+    log_fn=print,
+) -> dict:
+    """Score a list of sentences (e.g. FLORES devtest) under ``model``.
+
+    Sentences are concatenated with a single space separator before tokenizing,
+    so the windowed scoring sees a continuous stream — one FLORES sentence is
+    too short to fill a 512-token context on its own. Cross-sentence prediction
+    is unrealistic but the resulting numbers are consistent across tokenizers,
+    which is all we need for the comparison.
+    """
+    import numpy as np
+
+    joined = " ".join(s.strip() for s in sentences if s and s.strip())
+    if not joined:
+        raise RuntimeError(f"No non-empty sentences in '{label}' eval set.")
+    ids = tokenizer.encode(joined)
+    if not ids:
+        raise RuntimeError(f"Tokenizer produced 0 ids for '{label}' eval text.")
+    eval_ids = np.asarray(ids, dtype=np.int32)
+    eval_bytes = len(joined.encode("utf-8"))
+    log_fn(f"  eval ({label}): {eval_ids.shape[0]:,} tokens, {eval_bytes:,} bytes")
+    return _score_ids(model, eval_ids, eval_bytes, cfg, device, amp_dtype)
+
+
+def load_flores_devtest(language: str) -> list[str]:
+    """Return FLORES-200 devtest sentences for ``language`` (en/zh/tr/ru/hi).
+
+    Uses the canonical ``facebook/flores`` dataset on the Hub. Network call;
+    cached by the ``datasets`` library after the first hit.
+    """
+    if language not in FLORES_CONFIGS:
+        raise ValueError(
+            f"No FLORES config registered for language {language!r}. "
+            f"Known: {sorted(FLORES_CONFIGS)}"
+        )
+    config = FLORES_CONFIGS[language]
+    from datasets import load_dataset
+
+    ds = load_dataset("facebook/flores", config, split="devtest")
+    # FLORES rows have a 'sentence' field (canonical translation in `config`).
+    return [row["sentence"] for row in ds]
 
 
 # ---------------------------------------------------------------------------
@@ -452,15 +602,54 @@ def train_and_evaluate(
     eval_corpus_path: Path,
     cfg: LLMConfig,
     log_fn=print,
+    language: str | None = None,
+    eval_flores: bool = True,
+    wandb_extra_config: dict | None = None,
 ) -> dict:
-    """Train an LM with `tokenizer` then return perplexity + BPB on the eval set."""
-    model, device, amp_dtype, train_seconds = train_lm(
-        tokenizer, train_corpus_path, cfg, log_fn=log_fn
-    )
-    metrics = evaluate_perplexity(
-        model, tokenizer, eval_corpus_path, cfg, device, amp_dtype, log_fn=log_fn
-    )
-    metrics["param_count"] = count_parameters(model)
-    metrics["train_seconds"] = train_seconds
-    metrics["config"] = asdict(cfg)
-    return metrics
+    """Train an LM with ``tokenizer`` then score it on test set + (optionally) FLORES.
+
+    Each LM is monolingual: it sees only ``train_corpus_path`` (single-language
+    by construction) and is scored on monolingual eval sets.
+
+    Returns metrics with ``test_*`` and ``flores_*`` keys (the latter only if
+    FLORES eval ran). If ``cfg.wandb_project`` is set, a W&B run is opened
+    around the train+eval loop and final metrics are logged to its summary.
+    """
+    wandb_run = _init_wandb(cfg, extra_config=wandb_extra_config)
+    try:
+        model, device, amp_dtype, train_seconds = train_lm(
+            tokenizer, train_corpus_path, cfg, log_fn=log_fn, wandb_run=wandb_run,
+        )
+
+        out: dict = {}
+        test_metrics = evaluate_perplexity(
+            model, tokenizer, eval_corpus_path, cfg, device, amp_dtype, log_fn=log_fn,
+        )
+        for k, v in test_metrics.items():
+            out[f"test_{k}"] = v
+
+        if eval_flores and language is not None:
+            try:
+                flores_sents = load_flores_devtest(language)
+            except Exception as exc:
+                log_fn(f"  FLORES eval skipped: {exc}")
+            else:
+                flores_metrics = evaluate_perplexity_on_sentences(
+                    model, tokenizer, flores_sents, cfg, device, amp_dtype,
+                    label=f"flores/{FLORES_CONFIGS[language]}", log_fn=log_fn,
+                )
+                for k, v in flores_metrics.items():
+                    out[f"flores_{k}"] = v
+
+        out["param_count"] = count_parameters(model)
+        out["train_seconds"] = train_seconds
+        out["config"] = asdict(cfg)
+
+        if wandb_run is not None:
+            for k, v in out.items():
+                if isinstance(v, (int, float)):
+                    wandb_run.summary[k] = v
+        return out
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()

@@ -1,17 +1,25 @@
 """Train one small LM per tokenizer artifact and write llm_results.csv.
 
 This is the *downstream* tokenizer evaluation: train a fixed-architecture
-~50M-param GPT with each tokenizer (held-fixed token budget per the spec),
-then measure held-out perplexity + bits-per-byte. BPB is the
-cross-tokenizer-comparable metric — raw perplexity isn't.
+~50M-param GPT with each tokenizer (training-token budget held fixed per spec),
+then score held-out PPL + bits-per-byte on two eval sets:
+  - the in-domain FineWeb test split, and
+  - FLORES-200 devtest (out-of-distribution).
+
+Each LM is monolingual.
 
 Run after ``generate_tokenizers.py``. Requires the ``llm`` extras:
 
     pip install -e ".[llm]"
 
+Optional Weights & Biases logging: set ``WANDB_PROJECT`` below (or drop a key
+into ``tokens/wandb.token`` / set ``WANDB_API_KEY``). One W&B run per
+(language, algorithm, vocab_size) combo.
+
 Edit the constants below to change the run.
 """
 
+import os
 from pathlib import Path
 
 from src.tools.train_llm import train_all_llms
@@ -28,17 +36,29 @@ ONLY_LANGUAGES: list[str] | None = None      # e.g. ["en", "tr"]
 ONLY_ALGORITHMS: list[str] | None = None     # e.g. ["bpe", "tiktoken"]
 ONLY_VOCAB_SIZES: list[int] | None = None    # e.g. [32_000]
 
-# LM training/architecture config. Defaults: ~50M params at 32k vocab,
-# 50M training tokens. Tune down for smoke tests, up for the real sweep.
+# Eval FLORES-200 in addition to the test set. Needs network on first run
+# (HF dataset is cached afterwards).
+EVAL_FLORES = True
+
+# W&B: None disables logging entirely. Otherwise the named project is created
+# in your default W&B account; entity overrides the account if needed.
+WANDB_PROJECT: str | None = os.environ.get("WANDB_PROJECT")  # e.g. "tokenizer-bench"
+WANDB_ENTITY: str | None = os.environ.get("WANDB_ENTITY")
+
+# LM training/architecture config. Defaults: ~50M params at 32k vocab, 1B
+# training tokens (~Chinchilla-optimal for this size; ~65 min on A100 40GB).
+# Tune `train_tokens` down for smoke tests / a sweep that won't ruin the cluster.
 LLM_CONFIG = LLMConfig(
     d_model=512,
     n_layers=8,
     n_heads=8,
     d_ff=2048,
     ctx_len=512,
-    train_tokens=50_000_000,
+    train_tokens=1_000_000_000,
     batch_size=32,
     learning_rate=3e-4,
+    wandb_project=WANDB_PROJECT,
+    wandb_entity=WANDB_ENTITY,
 )
 
 if __name__ == "__main__":
@@ -51,4 +71,5 @@ if __name__ == "__main__":
         only_languages=ONLY_LANGUAGES,
         only_algorithms=ONLY_ALGORITHMS,
         only_vocab_sizes=ONLY_VOCAB_SIZES,
+        eval_flores=EVAL_FLORES,
     )

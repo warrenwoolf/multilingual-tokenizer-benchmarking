@@ -98,13 +98,47 @@ def test_train_and_evaluate_returns_finite_metrics(tiny_corpus, trained_bpe):
         eval_corpus_path=tiny_corpus,  # same fixture for the smoke test
         cfg=TINY_CONFIG,
         log_fn=lambda *a, **k: None,
+        # language=None disables FLORES; we don't want network in unit tests.
+        eval_flores=False,
     )
-    assert math.isfinite(metrics["perplexity"])
-    assert metrics["perplexity"] > 1.0  # PPL is bounded below by 1
-    assert math.isfinite(metrics["bits_per_byte"])
-    assert metrics["bits_per_byte"] > 0
+    assert math.isfinite(metrics["test_perplexity"])
+    assert metrics["test_perplexity"] > 1.0  # PPL is bounded below by 1
+    assert math.isfinite(metrics["test_bits_per_byte"])
+    assert metrics["test_bits_per_byte"] > 0
     assert metrics["param_count"] > 0
-    assert metrics["eval_tokens_scored"] > 0
+    assert metrics["test_eval_tokens_scored"] > 0
+    # FLORES eval was disabled, so flores_* keys must not be present.
+    assert not any(k.startswith("flores_") for k in metrics)
+
+
+def test_flores_config_map_is_complete():
+    """Every language we configure for tokenizer training has a FLORES code."""
+    from src.prepare_data.download_datasets import LANGUAGE_CONFIGS
+    from src.utils.llm_training import FLORES_CONFIGS
+
+    missing = set(LANGUAGE_CONFIGS) - set(FLORES_CONFIGS)
+    assert not missing, f"FLORES_CONFIGS missing entries for {missing}"
+
+
+def test_load_flores_rejects_unknown_language():
+    from src.utils.llm_training import load_flores_devtest
+
+    with pytest.raises(ValueError, match="No FLORES config"):
+        load_flores_devtest("xx")
+
+
+def test_wandb_disabled_when_project_unset(tiny_corpus, trained_bpe):
+    """No W&B run is created when ``wandb_project`` is None — tests stay offline."""
+    cfg = LLMConfig(**{**vars(TINY_CONFIG), "wandb_project": None})
+    metrics = train_and_evaluate(
+        tokenizer=trained_bpe,
+        train_corpus_path=tiny_corpus,
+        eval_corpus_path=tiny_corpus,
+        cfg=cfg,
+        eval_flores=False,
+        log_fn=lambda *a, **k: None,
+    )
+    assert "test_perplexity" in metrics
 
 
 def test_perplexity_matches_exp_of_mean_nll(tiny_corpus, trained_bpe):

@@ -24,9 +24,11 @@ dev = [
     "pytest-xdist>=3.5",
 ]
 # Downstream LLM-perplexity evaluation (train_llms.py). Heavy dep, opt-in.
+# Includes W&B for run logging; skip with --no-deps if you don't want it.
 llm = [
     "torch>=2.1",
     "numpy>=1.24",
+    "wandb>=0.16",
 ]
 
 [tool.setuptools.packages.find]

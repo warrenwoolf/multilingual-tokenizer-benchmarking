@@ -68,14 +68,21 @@ Implemented in `src/utils/evaluation_metrics.py`:
 
 ### Downstream LLM (expensive; predictive)
 
-Implemented in `src/utils/llm_training.py`:
+Implemented in `src/utils/llm_training.py`. Each tokenizer trains a fresh
+**monolingual** ~50M-param GPT on its language's corpus, then we score two
+held-out eval sets:
 
-- **Perplexity** — held-out per-token PPL of a small (~50M-param) GPT trained
-  with the candidate tokenizer. Useful within a tokenizer; *not* comparable
-  across tokenizers because PPL depends on vocab/segmentation.
+- **Test set** (in-domain) — `data/{lang}/eval.txt` from FineWeb / FineWeb 2.
+- **FLORES-200 devtest** (out-of-distribution) — `facebook/flores`,
+  professionally translated, the standard cross-lingual generalisation probe.
+
+For each, we report:
+
 - **Bits-per-byte (BPB)** — held-out cross-entropy normalised by raw UTF-8
   bytes of the eval text. **This is the cross-tokenizer-comparable metric.**
   Lower = the tokenizer enables a better LM at fixed compute.
+- **Perplexity** — kept for diagnostics; *not* comparable across tokenizers
+  because PPL depends on vocab/segmentation.
 
 Architecture: pre-LN GPT decoder, d_model=512, 8 layers, 8 heads, d_ff=2048,
 ctx=512, weight-tied head. Param count varies with vocab (the embedding
@@ -87,12 +94,23 @@ table dominates):
 | 32 k  | ~42 M  |
 | 64 k  | ~58 M  |
 
+**Wall-clock** (1B-token Chinchilla-optimal run, A100 40GB at ~250K tok/s
+bf16): ~65 min per LM. Full default sweep of 3 langs × 3 algos × 4 vocab
+sizes ≈ 36 LMs ≈ ~40 A100-hours. Shrink the vocab sweep before kicking off.
+
 **Compute fairness caveat.** We fix the *training-token budget* across all
-tokenizers (default 50 M tokens). This is intentionally imperfect: a high-
-fertility tokenizer sees less *content* for the same token count, and a
-larger-vocab tokenizer has a bigger embedding so more FLOPs/token. Fixing
-wall-clock or training-FLOPs would be more rigorous; for v1 we trade rigor
-for reproducibility and document the caveat. See `llm_training.py` docstring.
+tokenizers (default 1B tokens, ~Chinchilla-optimal for 50M params). This
+is intentionally imperfect: a high-fertility tokenizer sees less *content*
+for the same token count, and a larger-vocab tokenizer has a bigger
+embedding so more FLOPs/token. Fixing wall-clock or training-FLOPs would
+be more rigorous; for v1 we trade rigor for reproducibility and document
+the caveat. See `llm_training.py` docstring.
+
+**Logging.** Every (lang, algo, vocab) run optionally streams loss + LR +
+final eval metrics to Weights & Biases. Set `WANDB_PROJECT` (env var or in
+`train_llms.py`); the API key is loaded from `WANDB_API_KEY` env var or
+`tokens/wandb.token` (gitignored). In Colab, `colab.py` reads the
+`WANDB_API_KEY` Colab Secret and writes it to the token slot for you.
 
 ## Quick start
 
