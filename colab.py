@@ -36,10 +36,21 @@ if not os.path.isdir(REPO_DIR):
     !git clone --branch {BRANCH} {REPO_URL} {REPO_DIR}
 %cd {REPO_DIR}
 
-# 2. Install dependencies (editable so any tweaks take effect immediately)
+# 2. Persist HuggingFace token from Colab Secrets into tokens/hf_token
+try:
+    from google.colab import userdata as _userdata
+    _hf_token = _userdata.get('HF_TOKEN')
+    if _hf_token:
+        with open('tokens/hf_token', 'w') as _fh:
+            _fh.write(_hf_token)
+        os.environ['HF_TOKEN'] = _hf_token
+except Exception:
+    pass  # not running in Colab or secret not set
+
+# 3. Install dependencies (editable so any tweaks take effect immediately)
 !pip install -q -e .
 
-# 3. Override the per-script config via env-var-friendly Python overrides.
+# 4. Override the per-script config via env-var-friendly Python overrides.
 #    Each script is config-only at the top, so a tiny shim keeps the run
 #    parameterized without editing the file in the repo.
 shim = f"""
@@ -79,7 +90,7 @@ with open("/tmp/run_pipeline.py", "w") as fh:
     fh.write(shim)
 !python /tmp/run_pipeline.py
 
-# 4. Display results
+# 5. Display results
 import pandas as pd
 df = pd.read_csv("results.csv")
 print(df.to_string(index=False))
