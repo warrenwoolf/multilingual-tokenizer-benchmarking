@@ -21,6 +21,7 @@ byte-budget into eval.txt, sequentially.
 from __future__ import annotations
 
 import gc
+import os
 from pathlib import Path
 
 LANGUAGE_CONFIGS: dict[str, dict] = {
@@ -33,6 +34,18 @@ LANGUAGE_CONFIGS: dict[str, dict] = {
 
 DEFAULT_TRAIN_BUDGET_MB = 500
 DEFAULT_EVAL_BUDGET_MB = 25
+
+
+def _load_token() -> str | None:
+    """Return HF token from HF_TOKEN env var or tokens/hf_token file."""
+    token = os.environ.get('HF_TOKEN')
+    if token:
+        return token
+    token_path = Path('tokens/hf_token')
+    if token_path.is_file():
+        token = token_path.read_text().strip()
+        return token or None
+    return None
 
 
 def download_language(
@@ -67,12 +80,15 @@ def download_language(
 
     cfg = LANGUAGE_CONFIGS[language]
     from datasets import load_dataset
+    from tqdm.auto import tqdm
 
+    token = _load_token()
     stream = load_dataset(
         cfg["repo"],
         name=cfg["config"],
         split="train",
         streaming=True,
+        token=token,
     )
 
     train_budget = int(train_budget_mb * 1024 * 1024)
@@ -83,7 +99,12 @@ def download_language(
     train_full = False
 
     with train_path.open("w", encoding="utf-8") as train_fh, \
-         eval_path.open("w", encoding="utf-8") as eval_fh:
+         eval_path.open("w", encoding="utf-8") as eval_fh, \
+         tqdm(
+             total=train_budget + eval_budget,
+             unit="B", unit_scale=True, unit_divisor=1024,
+             desc=f"  {language}",
+         ) as pbar:
         for example in stream:
             text = example.get("text", "").strip()
             if not text:
@@ -97,6 +118,7 @@ def download_language(
                 else:
                     train_fh.write(line)
                     train_written += n
+                    pbar.update(n)
                     continue
 
             # Train budget hit; fill eval.
@@ -108,6 +130,7 @@ def download_language(
                 continue
             eval_fh.write(line)
             eval_written += n
+            pbar.update(n)
 
     # Explicitly release the Arrow reader and run GC to avoid SIGABRT when the
     # iterator is abandoned mid-stream.  The datasets streaming backend holds
@@ -153,7 +176,7 @@ def verify_fineweb2_configs(languages: list[str]) -> None:
         return
     try:
         from datasets import get_dataset_config_names
-        configs = set(get_dataset_config_names("HuggingFaceFW/fineweb-2"))
+        configs = set(get_dataset_config_names("HuggingFaceFW/fineweb-2", token=_load_token()))
     except Exception as exc:
         print(f"[warn] could not verify fineweb-2 configs: {exc}")
         return
