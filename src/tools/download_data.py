@@ -14,8 +14,8 @@ from src.prepare_data.download_datasets import (
 def download_all_languages(
     languages: list[str],
     data_dir: Path,
-    train_budget_mb: float,
-    eval_budget_mb: float,
+    max_train_rows: int = 500_000,
+    max_eval_rows: int = 25_000,
     skip_verify: bool = False,
 ) -> dict[str, dict[str, Path]]:
     """Download each language; return a map of ``lang -> {train, eval}`` paths.
@@ -38,14 +38,14 @@ def download_all_languages(
     out: dict[str, dict[str, Path]] = {}
     for lang in languages:
         print(
-            f"[{lang}] streaming up to {train_budget_mb} MB train + "
-            f"{eval_budget_mb} MB eval ..."
+            f"[{lang}] streaming up to {max_train_rows:,} train rows + "
+            f"{max_eval_rows:,} eval rows ..."
         )
         paths = download_language(
             language=lang,
             output_dir=data_dir,
-            train_budget_mb=train_budget_mb,
-            eval_budget_mb=eval_budget_mb,
+            max_train_rows=max_train_rows,
+            max_eval_rows=max_eval_rows,
         )
         train_size = paths["train"].stat().st_size / 1e6
         eval_size = paths["eval"].stat().st_size / 1e6
