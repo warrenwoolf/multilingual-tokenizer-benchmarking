@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import sys
 import traceback
 from pathlib import Path
@@ -114,11 +115,10 @@ def iter_jobs(
     Algorithms in SINGLE_SIZE_ALGORITHMS get their actual fixed vocab size
     instead of the sweep values, so artifact names reflect the real vocab.
     """
-    for lang in languages:
-        for algo in algorithms:
-            sizes = [_FIXED_VOCAB_SIZES[algo]] if algo in SINGLE_SIZE_ALGORITHMS else vocab_sizes
-            for vs in sizes:
-                yield lang, algo, vs
+    for lang, algo in itertools.product(languages, algorithms):
+        sizes = [_FIXED_VOCAB_SIZES[algo]] if algo in SINGLE_SIZE_ALGORITHMS else vocab_sizes
+        for vs in sizes:
+            yield lang, algo, vs
 
 
 def generate_all_tokenizers(

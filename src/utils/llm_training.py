@@ -354,20 +354,6 @@ def tokenize_corpus(
 # ---------------------------------------------------------------------------
 
 
-def _lr_at_step(step: int, total_steps: int, cfg: LLMConfig) -> float:
-    if step < cfg.warmup_steps:
-        return cfg.learning_rate * (step + 1) / max(1, cfg.warmup_steps)
-    if step >= total_steps:
-        return cfg.min_lr
-    progress = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return cfg.min_lr + (cfg.learning_rate - cfg.min_lr) * coeff
-
-
-def _sample_batch(token_array, batch_size: int, ctx_len: int, generator):
-    """Randomly sample ``batch_size`` (input, target) sequences of length ctx_len."""
-    raise RuntimeError("Manual sampling is removed; training uses HuggingFace Trainer")
-
 
 class _WindowDataset:
     """A lightweight Dataset that returns dicts {'input_ids', 'labels'}
