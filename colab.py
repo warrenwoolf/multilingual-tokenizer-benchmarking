@@ -86,11 +86,17 @@ if RUN_SUPERBPE:
     if not os.path.isdir(SUPERBPE_DIR):
         print(f"Cloning PythonNut/superbpe → {SUPERBPE_DIR}…")
         !git clone --recurse-submodules https://github.com/PythonNut/superbpe.git {SUPERBPE_DIR}
-    # Install superbpe's Python requirements
-    !pip install -q -r {SUPERBPE_DIR}/requirements.txt
-    # Install the patched tokenizers fork (compiles Rust extension, ~5-15 min)
+    # Install superbpe's Python requirements.  Must run from SUPERBPE_DIR because
+    # requirements.txt contains "-e tokenizers_superbpe/bindings/python/" — a
+    # relative editable path that only resolves from inside the repo.
+    !cd {SUPERBPE_DIR} && pip install -q -r requirements.txt
+    # Install the patched tokenizers fork (compiles Rust extension, ~5-15 min).
+    # This replaces the standard `tokenizers` with an older 0.20.x-based fork.
     print("Building alisawuffles/tokenizers-superbpe (compiles Rust — grab a coffee)…")
     !pip install -q "git+https://github.com/alisawuffles/tokenizers-superbpe.git@main#subdirectory=bindings/python"
+    # The fork pins tokenizers 0.20.x, which is incompatible with transformers 5.x.
+    # Downgrade transformers to a version that accepts tokenizers>=0.20.
+    !pip install -q "transformers>=4.40,<5.0"
     os.environ["SUPERBPE_REPO"] = os.path.abspath(SUPERBPE_DIR)
     print(f"SuperBPE ready.  SUPERBPE_REPO={os.environ['SUPERBPE_REPO']}")
 

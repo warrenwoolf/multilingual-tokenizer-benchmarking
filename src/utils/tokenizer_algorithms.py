@@ -339,18 +339,21 @@ def _train_morphbpe(
 
 
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
-    """Shell out to the official PythonNut/superbpe scripts.
+    """Call train_tokenizer.py from the PythonNut/superbpe repo directly.
 
     Requires SUPERBPE_REPO env var pointing to a cloned superbpe repo, Python
-    3.12, and the patched alisawuffles/tokenizers-superbpe fork installed
+    3.12, and the alisawuffles/tokenizers-superbpe fork installed
     (handled by `make install-superbpe`).
 
-    The superbpe workflow is two-stage:
-      1. train a vanilla BPE with whitespace pre-tokenizer
-      2. extend by training a second stage without whitespace pre-tokenization
-    We allocate 90% of the vocab budget to stage 1 and 10% to the stage-2
-    transition, matching the paper's reported 180k/200k split ratio.
+    The two-stage workflow mirrors extend_tokenizer.sh:
+      Stage 1 — train standard BPE on 90% of the vocab budget with a corpus dir.
+      Stage 2 — extend with cross-word merges (remaining 10%) by seeding the
+                stage-2 dir with stage-1 merges+metadata and re-running without
+                --corpus_dir so train_tokenizer reads the paths from meta.json.
     """
+    import shutil
+    import sys as _sys
+
     repo = os.environ.get("SUPERBPE_REPO")
     if not repo:
         raise RuntimeError(
@@ -358,40 +361,57 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
             "cloned PythonNut/superbpe repo. Run `make install-superbpe` first."
         )
     repo_path = Path(repo).resolve()
-    if not (repo_path / "scripts" / "train_tokenizer.sh").exists():
+    if not (repo_path / "train_tokenizer.py").exists():
         raise RuntimeError(
             f"SUPERBPE_REPO={repo_path} does not look like a superbpe clone "
-            "(missing scripts/train_tokenizer.sh)."
+            "(missing train_tokenizer.py)."
         )
 
+    # Resolve all paths up front so they stay valid when cwd=repo_path.
+    corpus_path = corpus_path.resolve()
     stage1_size = int(vocab_size * 0.9)
-    work_dir = output_dir / "_superbpe_work"
-    work_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = output_dir.resolve() / "_superbpe_work"
+    stage1_dir = work_dir / "stage1"
+    stage2_dir = work_dir / "stage2"
 
-    stage1 = subprocess.run(
-        [
-            "bash",
-            str(repo_path / "scripts" / "train_tokenizer.sh"),
-            str(corpus_path),
-            str(stage1_size),
-            str(work_dir / "stage1"),
-        ],
-        check=True,
-    )
+    # train_tokenizer.py expects --corpus_dir (a directory), not a single file.
+    # Expose the corpus file inside a small directory via a symlink.
+    corpus_dir = work_dir / "corpus"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    corpus_link = corpus_dir / corpus_path.name
+    if not corpus_link.exists():
+        corpus_link.symlink_to(corpus_path)
+
+    # Stage 1: word-boundary-respecting BPE.
+    stage1_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
-            "bash",
-            str(repo_path / "scripts" / "extend_tokenizer.sh"),
-            str(work_dir / "stage1"),
-            str(corpus_path),
-            str(vocab_size),
-            str(work_dir / "stage2"),
+            _sys.executable, "-m", "train_tokenizer",
+            "--output_dir", str(stage1_dir),
+            "--corpus_dir", str(corpus_dir),
+            "--vocab_size", str(stage1_size),
         ],
         check=True,
+        cwd=str(repo_path),
     )
 
-    # The extended tokenizer.json is the artifact.
-    final = work_dir / "stage2" / "tokenizer.json"
+    # Stage 2: cross-word extension (the SuperBPE step).
+    # Seed stage2 with stage1's merges and meta.json so train_tokenizer extends
+    # rather than retrains. No --corpus_dir needed; it reads paths from meta.json.
+    stage2_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(stage1_dir / "merges.txt", stage2_dir / "merges.txt")
+    shutil.copy(stage1_dir / "meta.json", stage2_dir / "meta.json")
+    subprocess.run(
+        [
+            _sys.executable, "-m", "train_tokenizer",
+            "--output_dir", str(stage2_dir),
+            "--vocab_size", str(vocab_size),
+        ],
+        check=True,
+        cwd=str(repo_path),
+    )
+
+    final = stage2_dir / "tokenizer.json"
     if not final.exists():
         raise RuntimeError(f"SuperBPE finished but no tokenizer.json at {final}")
     (output_dir / _TOKENIZER_FILENAME).write_bytes(final.read_bytes())
