@@ -8,7 +8,6 @@ so the main project never needs to embed the old manual implementation.
 from __future__ import annotations
 
 import os
-import shutil
 import shlex
 import subprocess
 from pathlib import Path
@@ -21,6 +20,11 @@ SUPERBPE_STAGE1_REGEX = (
     r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 SUPERBPE_STAGE2_REGEX = r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]{2,}[\r\n/]*| +(?!\S)"
+
+# Stage-2 byte budget default (200 MB). Stage-2 pretokens are paragraph-sized
+# because the regex doesn't split on letters, so cost is O(bytes × stage1_merges).
+# Override via SUPERBPE_STAGE2_BYTES env var.
+_DEFAULT_STAGE2_BYTES = 2 * 10**8
 
 
 class SuperBPESetupError(RuntimeError):
@@ -85,7 +89,55 @@ def run_script(script: str, args: Sequence[str] | None = None) -> int:
     return subprocess.call(cmd, env=env)
 
 
-def train_superbpe(corpus_path: str | Path, vocab_size: int, output_dir: str | Path) -> None:
+def _prepare_superbpe_corpus(src: Path, dst: Path) -> None:
+    """Copy corpus to dst, truncating lines above the p99 length threshold.
+
+    Very long documents become giant single pretokens in stage 2 (the regex
+    doesn't split on letters), disproportionately slowing merge computation.
+    We replicate the original paper's top-1% truncation by computing the 99th
+    percentile of line lengths and capping any line that exceeds it.
+    """
+    import statistics
+
+    lines = src.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    lengths = [len(line) for line in lines]
+
+    if not lengths:
+        dst.write_text("", encoding="utf-8")
+        return
+
+    lengths_sorted = sorted(lengths)
+    p99_idx = max(0, int(len(lengths_sorted) * 0.99) - 1)
+    threshold = lengths_sorted[p99_idx]
+
+    truncated = 0
+    out_lines = []
+    for line in lines:
+        if len(line) > threshold:
+            line = line[:threshold].rstrip() + "\n"
+            truncated += 1
+        out_lines.append(line)
+
+    dst.write_text("".join(out_lines), encoding="utf-8")
+
+    total = len(lines)
+    max_len = max(lengths)
+    mean_len = statistics.mean(lengths)
+    print(
+        f"[superbpe corpus] {total} documents — "
+        f"p99 threshold {threshold:,} chars, "
+        f"max {max_len:,} chars, "
+        f"mean {mean_len:.0f} chars, "
+        f"truncated {truncated} ({truncated / total:.1%})"
+    )
+
+
+def train_superbpe(
+    corpus_path: str | Path,
+    vocab_size: int,
+    output_dir: str | Path,
+    stage2_bytes: int | None = None,
+) -> None:
     """Train SuperBPE using the official PythonNut/superbpe repo.
 
     The official trainer performs stage 1 and stage 2 through its own
@@ -93,12 +145,20 @@ def train_superbpe(corpus_path: str | Path, vocab_size: int, output_dir: str | P
     module twice: once with whitespace-aware pretokenization and once with
     whitespace disabled, reusing the same output directory so stage 2
     resumes from the stage-1 merges.
+
+    stage2_bytes caps how much corpus stage 2 sees (default 200 MB via
+    SUPERBPE_STAGE2_BYTES env var). Stage 2 cost is O(bytes × stage1_merges)
+    because the regex doesn't split on letters, so unbounded corpus OOMs.
+    Stage 1 always sees the full corpus.
     """
     repo = _repo_path()
     if not repo.exists():
         raise SuperBPESetupError(
             f"SuperBPE repo not found at {repo}. Run scripts/install_superbpe.sh or make install-superbpe first."
         )
+
+    if stage2_bytes is None:
+        stage2_bytes = int(os.environ.get("SUPERBPE_STAGE2_BYTES", _DEFAULT_STAGE2_BYTES))
 
     corpus_path = Path(corpus_path).resolve()
     output_dir = Path(output_dir).resolve()
@@ -109,10 +169,14 @@ def train_superbpe(corpus_path: str | Path, vocab_size: int, output_dir: str | P
     corpus_dir = output_dir / ".superbpe_corpus"
     corpus_dir.mkdir(parents=True, exist_ok=True)
     copied_corpus = corpus_dir / "train.txt"
-    shutil.copy2(corpus_path, copied_corpus)
-    num_bytes = copied_corpus.stat().st_size
+    _prepare_superbpe_corpus(corpus_path, copied_corpus)
+    full_bytes = copied_corpus.stat().st_size
+    stage2_bytes = min(stage2_bytes, full_bytes)
     stage1_vocab = max(1, int(vocab_size * 0.9))
 
+    print(
+        f"[superbpe] stage 1 — num_bytes={full_bytes:,} vocab={stage1_vocab}"
+    )
     _run_repo_python(
         repo,
         [
@@ -123,7 +187,7 @@ def train_superbpe(corpus_path: str | Path, vocab_size: int, output_dir: str | P
             "--corpus_dir",
             str(corpus_dir),
             "--num_bytes",
-            str(num_bytes),
+            str(full_bytes),
             "--vocab_size",
             str(stage1_vocab),
             "--regex_string",
@@ -131,6 +195,17 @@ def train_superbpe(corpus_path: str | Path, vocab_size: int, output_dir: str | P
         ],
     )
 
+    # Stage 2 must re-select corpus files at the smaller byte budget.
+    # The upstream trainer reuses meta.json from stage 1 when it exists,
+    # which would ignore --num_bytes and use the full stage-1 selection.
+    # Delete it so stage 2 triggers a fresh, smaller selection.
+    meta_json = output_dir / "meta.json"
+    if meta_json.exists():
+        meta_json.unlink()
+
+    print(
+        f"[superbpe] stage 2 — num_bytes={stage2_bytes:,} vocab={vocab_size}"
+    )
     _run_repo_python(
         repo,
         [
@@ -141,7 +216,7 @@ def train_superbpe(corpus_path: str | Path, vocab_size: int, output_dir: str | P
             "--corpus_dir",
             str(corpus_dir),
             "--num_bytes",
-            str(num_bytes),
+            str(stage2_bytes),
             "--vocab_size",
             str(vocab_size),
             "--regex_string",

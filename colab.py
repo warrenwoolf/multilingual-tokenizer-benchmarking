@@ -33,6 +33,16 @@ MAX_EVAL_ROWS = 5_000
 RUN_LLM_EVAL = False
 LLM_TRAIN_TOKENS = 50_000_000      # 1B for the real Chinchilla-optimal sweep
 WANDB_PROJECT = "tokenizer-bench"  # set to None to disable W&B logging
+
+# Split CPU / GPU workflow via W&B artifact transfer.
+# Step 1 (CPU node): set UPLOAD_TOKENIZER_ARTIFACTS = True to train and push.
+# Step 2 (GPU node): set DOWNLOAD_TOKENIZER_ARTIFACTS = True to skip training
+#   and pull artifacts from W&B before LLM eval.
+# Both require WANDB_API_KEY in Colab Secrets and a matching TOKENIZER_WANDB_PROJECT.
+UPLOAD_TOKENIZER_ARTIFACTS = False
+DOWNLOAD_TOKENIZER_ARTIFACTS = False
+TOKENIZER_WANDB_PROJECT = "tokenizer-bench"   # project used for artifact storage
+TOKENIZER_WANDB_ENTITY = None                 # set to your W&B username/team, or None for default
 # ===========================================================================
 
 import os
@@ -114,7 +124,8 @@ if "superbpe" in ALGORITHMS.split(","):
 
 # 2b. Load the W&B API key from Colab Secrets if available, into tokens/wandb.token.
 #     Add a secret named WANDB_API_KEY in the Colab "key" sidebar before running.
-if RUN_LLM_EVAL and WANDB_PROJECT:
+_needs_wandb = (RUN_LLM_EVAL and WANDB_PROJECT) or UPLOAD_TOKENIZER_ARTIFACTS or DOWNLOAD_TOKENIZER_ARTIFACTS
+if _needs_wandb:
     try:
         from google.colab import userdata  # type: ignore
         wandb_key = userdata.get("WANDB_API_KEY")
@@ -128,10 +139,12 @@ if RUN_LLM_EVAL and WANDB_PROJECT:
         print("Loaded WANDB_API_KEY from Colab secrets.")
     else:
         print(
-            "WANDB_API_KEY not set in Colab secrets — W&B logging will be skipped. "
+            "WANDB_API_KEY not set in Colab secrets — W&B features will be skipped. "
             "Add it via the 'key' icon in the Colab sidebar to enable."
         )
         WANDB_PROJECT = None
+        UPLOAD_TOKENIZER_ARTIFACTS = False
+        DOWNLOAD_TOKENIZER_ARTIFACTS = False
 
 # 4. Override the per-script config via env-var-friendly Python overrides.
 #    Each script is config-only at the top, so a tiny shim keeps the run
@@ -149,16 +162,34 @@ download_all_languages(
     max_eval_rows={MAX_EVAL_ROWS},
 )
 
-# --- train ---
-from src.tools.create_tokenizer import generate_all_tokenizers
-generate_all_tokenizers(
-    languages={LANGUAGES.split(',')!r},
-    algorithms={ALGORITHMS.split(',')!r},
-    vocab_sizes=[int(v) for v in {VOCAB_SIZES.split(',')!r}],
-    data_dir='data',
-    artifact_dir='artifacts',
-    continue_on_error=True,
-)
+if {DOWNLOAD_TOKENIZER_ARTIFACTS}:
+    # GPU node: pull tokenizer artifacts from W&B, skip training.
+    from src.tools.wandb_artifacts import pull_tokenizer_artifacts
+    pull_tokenizer_artifacts(
+        artifact_dir='artifacts',
+        project={TOKENIZER_WANDB_PROJECT!r},
+        entity={TOKENIZER_WANDB_ENTITY!r},
+    )
+else:
+    # --- train ---
+    from src.tools.create_tokenizer import generate_all_tokenizers
+    generate_all_tokenizers(
+        languages={LANGUAGES.split(',')!r},
+        algorithms={ALGORITHMS.split(',')!r},
+        vocab_sizes=[int(v) for v in {VOCAB_SIZES.split(',')!r}],
+        data_dir='data',
+        artifact_dir='artifacts',
+        continue_on_error=True,
+    )
+
+    if {UPLOAD_TOKENIZER_ARTIFACTS}:
+        # CPU node: push freshly trained artifacts to W&B for the GPU node.
+        from src.tools.wandb_artifacts import push_tokenizer_artifacts
+        push_tokenizer_artifacts(
+            artifact_dir='artifacts',
+            project={TOKENIZER_WANDB_PROJECT!r},
+            entity={TOKENIZER_WANDB_ENTITY!r},
+        )
 
 # --- evaluate (intrinsic metrics) ---
 from src.tools.evaluate_tokenizer import evaluate_all_tokenizers
