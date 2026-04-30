@@ -342,27 +342,35 @@ def test_bpe_decode_drops_interword_spaces(tiny_corpus, tmp_path):
 
 
 # ---------- MorphBPE decode behaviour --------------------------------------
-# MorphBPE uses a ByteLevel pre-tokenizer so the Ġ prefix on word-initial
-# subwords encodes inter-word boundaries.  The ByteLevel decoder reverses
-# this, reconstructing spaces correctly for both single-word and multi-word
-# inputs.
+# MorphBPEAdapter segments each word into morphemes at encode time, so the
+# inference distribution matches training.  decode() returns the morpheme-
+# split text (spaces at morpheme boundaries) — faithful round-trip to the
+# original word is intentionally not preserved, because BPB measurement uses
+# the original text byte count, not the decoded output.
 
 
-def test_morphbpe_single_word_decode_is_lossless(morphbpe_tokenizer):
-    """Single-word inputs: decode(encode(word)) == word (morphemes concatenate)."""
-    for word in ["happiness", "tokenization", "uncomfortable", "running"]:
+def test_morphbpe_single_word_decode_shows_morpheme_splits(morphbpe_tokenizer):
+    """decode(encode(word)) returns the morpheme-segmented form, not the original word."""
+    cases = {
+        "running": "run n ing",
+        "happiness": "happi ness",
+        "tokenization": "token iz ation",
+        "uncomfortable": "un comfort able",
+    }
+    for word, expected in cases.items():
         decoded = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(word))
-        assert decoded == word, (
-            f"MorphBPE single-word decode should be lossless: {word!r} -> {decoded!r}"
+        assert decoded == expected, (
+            f"MorphBPE decode should produce morpheme-split text: "
+            f"{word!r} -> {decoded!r}, expected {expected!r}"
         )
 
 
-def test_morphbpe_multiword_decode_drops_spaces(morphbpe_tokenizer):
-    """Multi-word decode preserves inter-word spaces via ByteLevel pre-tokenizer."""
+def test_morphbpe_multiword_decode_preserves_word_boundaries(morphbpe_tokenizer):
+    """Words not in the MorphyNet lookup pass through unsplit; spaces are preserved."""
     text = "playing tennis"
     decoded = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(text))
     assert " " in decoded, (
-        "MorphBPE decode should preserve inter-word spaces via ByteLevel pre-tokenizer."
+        "MorphBPE decode should preserve spaces between words."
     )
 
 
@@ -488,14 +496,10 @@ def test_morphbpe_segment_corpus_splits_at_morpheme_boundaries(
     BPE with a ByteLevel pre-tokenizer splits on whitespace, so it cannot
     count or learn merges across spaces.  Replacing 'running' with 'run n ing'
     in the training corpus guarantees no cross-morpheme merge is ever learned.
-    This is what makes the approach equivalent to Algorithm 1 of Asgari et al.
-    2025 for the *training* path.
 
-    Note: the guarantee does NOT extend to inference.  When BPE tokenizes
-    the raw word 'running' (no spaces) it can compose within-morpheme merges
-    in ways that produce cross-morpheme output tokens (e.g. 'ning').  The
-    paper's inline-filter approach avoids this; our preprocessing is
-    equivalent only for what BPE is allowed to *learn*.
+    MorphBPEAdapter enforces the same constraint at inference time by
+    segmenting each word before encoding, so the inference distribution
+    matches training and cross-morpheme tokens cannot be produced.
     """
     from src.utils.morpheme_segmentation import segment_corpus
 
