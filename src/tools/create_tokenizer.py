@@ -14,6 +14,8 @@ from src.utils.tokenizer_algorithms import (
     train_tokenizer,
     load_tokenizer,
 )
+from src.tools.wandb_artifacts import push_tokenizer_artifact
+from src.tools.evaluate_tokenizer import evaluate_tokenizer_artifact
 
 # ByT5 has a fixed 256-byte vocab (training is a no-op), so we only emit one
 # artifact per language regardless of the requested vocab sweep.
@@ -142,6 +144,12 @@ def generate_all_tokenizers(
     data_dir: Path,
     artifact_dir: Path,
     continue_on_error: bool = False,
+    *,
+    skip_existing: bool = True,
+    evaluate_each: bool = False,
+    upload_each: bool = False,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
 ) -> list[Path]:
     """Train every (language × algorithm × vocab_size) combination.
 
@@ -179,6 +187,13 @@ def generate_all_tokenizers(
                 "(run download_data.py first)"
             )
             continue
+        # Skip if artifact already exists (useful when resuming or when
+        # artifacts were downloaded from W&B). The presence of tokenizer.json
+        # indicates a completed artifact.
+        artifact = artifact_dir / f"{lang}_{algo}_v{vs}"
+        if skip_existing and artifact.exists() and (artifact / "tokenizer.json").exists():
+            print(f"[{label}] SKIP: artifact already present at {artifact}")
+            continue
         print(f"[{label}] training ...")
         try:
             artifact = create_tokenizer_artifact(
@@ -201,6 +216,27 @@ def generate_all_tokenizers(
                 traceback.print_exc()
                 sys.exit(1)
             continue
+        # Immediately evaluate the freshly-trained artifact if requested.
+        if evaluate_each:
+            eval_corpus = data_dir / lang / "eval.txt"
+            if eval_corpus.exists():
+                try:
+                    metrics = evaluate_tokenizer_artifact(artifact, eval_corpus, algorithm=algo)
+                    print(f"[{label}] immediate metrics: {metrics}")
+                except Exception as exc:
+                    print(f"[{label}] immediate evaluation failed: {exc}")
+            else:
+                print(f"[{label}] immediate evaluation skipped: no eval corpus at {eval_corpus}")
+
+        # Immediately upload the artifact to W&B if requested.
+        if upload_each:
+            if wandb_project:
+                try:
+                    push_tokenizer_artifact(artifact, project=wandb_project, entity=wandb_entity)
+                except Exception as exc:
+                    print(f"[{label}] W&B upload failed (continuing): {exc}")
+            else:
+                print(f"[{label}] W&B upload requested but no project specified; skipping upload")
         successes.append(artifact)
         print(f"[{label}] wrote {artifact}")
 

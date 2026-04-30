@@ -69,6 +69,38 @@ def push_tokenizer_artifacts(
     print("[wandb] Upload complete.")
 
 
+def push_tokenizer_artifact(
+    artifact_path: str | Path,
+    project: str,
+    entity: str | None = None,
+    run_name: str | None = None,
+) -> None:
+    """Upload a single tokenizer artifact directory to W&B.
+
+    This is a small helper for workflows that want to push an artifact
+    immediately after it is created.
+    """
+    import wandb
+
+    _ensure_wandb_login()
+    artifact_path = Path(artifact_path)
+    if not artifact_path.exists() or not (artifact_path / "tokenizer.json").exists():
+        raise RuntimeError(f"No tokenizer artifact found at {artifact_path}")
+
+    run_name = run_name or f"upload-tokenizer-{artifact_path.name}"
+    with wandb.init(project=project, entity=entity, name=run_name, job_type="upload-tokenizer") as run:
+        art = wandb.Artifact(name=artifact_path.name, type=ARTIFACT_TYPE)
+        for item in artifact_path.iterdir():
+            if item.name.startswith("."):
+                continue
+            if item.is_dir():
+                art.add_dir(str(item), name=item.name)
+            else:
+                art.add_file(str(item))
+        run.log_artifact(art)
+    print(f"[wandb] uploaded: {artifact_path.name}")
+
+
 def pull_tokenizer_artifacts(
     artifact_dir: str | Path,
     project: str,

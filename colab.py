@@ -180,6 +180,10 @@ else:
         data_dir='data',
         artifact_dir='artifacts',
         continue_on_error=True,
+        evaluate_each=True,
+        upload_each={UPLOAD_TOKENIZER_ARTIFACTS},
+        wandb_project={TOKENIZER_WANDB_PROJECT!r},
+        wandb_entity={TOKENIZER_WANDB_ENTITY!r},
     )
 
     if {UPLOAD_TOKENIZER_ARTIFACTS}:
