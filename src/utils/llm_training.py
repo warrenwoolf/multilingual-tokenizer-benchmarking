@@ -645,12 +645,16 @@ def evaluate_perplexity_on_sentences(
     return _score_corpus(model, corpus, cfg, device, amp_dtype)
 
 
+_FLORES_CDN = "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
+
+
 def load_flores_devtest(language: str) -> list[str]:
     """Return FLORES-200 devtest sentences for ``language`` (en/zh/tr/ru/hi).
 
-    Tries ``facebook/flores`` first, then ``facebook/flores-200`` as a fallback
-    in case the dataset has been renamed or restructured on the Hub. Network
-    call; cached by the ``datasets`` library after the first hit.
+    Downloads the official FLORES-200 archive from Meta's CDN directly,
+    bypassing the HuggingFace datasets loading script (which is broken in
+    datasets >= 3.0). The archive is cached in the HF datasets cache dir
+    (or a system temp dir) so the download only happens once.
     """
     if language not in FLORES_CONFIGS:
         raise ValueError(
@@ -658,32 +662,32 @@ def load_flores_devtest(language: str) -> list[str]:
             f"Known: {sorted(FLORES_CONFIGS)}"
         )
     config = FLORES_CONFIGS[language]
-    from datasets import load_dataset
 
-    # facebook/flores uses an old dataset script (flores.py) that newer versions
-    # of the datasets library refuse to run. facebook/flores-200 is the modern
-    # parquet-backed replacement and should be tried first.
-    last_exc: Exception | None = None
-    for repo_id in ("facebook/flores-200", "facebook/flores"):
-        try:
-            ds = load_dataset(repo_id, config, split="devtest", trust_remote_code=False)
-            # Prefer the bare 'sentence' column; fall back to 'sentence_<config>'
-            # in case the dataset uses the all-languages column naming scheme.
-            col = "sentence" if "sentence" in ds.column_names else f"sentence_{config}"
-            if col not in ds.column_names:
-                raise KeyError(
-                    f"Neither 'sentence' nor 'sentence_{config}' found in "
-                    f"{repo_id!r} columns: {ds.column_names}"
-                )
-            return [row[col] for row in ds]
-        except Exception as exc:
-            last_exc = exc
-            continue
+    import tarfile
+    import tempfile
+    import urllib.request
 
-    raise RuntimeError(
-        f"Could not load FLORES devtest for {language!r} (config={config!r}) "
-        f"from any known repo. Last error: {last_exc}"
-    ) from last_exc
+    # Resolve cache directory: prefer HF datasets cache so it coexists with
+    # other cached datasets; fall back to a persistent temp dir.
+    try:
+        from datasets import config as _ds_cfg
+        cache_root = Path(_ds_cfg.HF_DATASETS_CACHE)
+    except Exception:
+        cache_root = Path(tempfile.gettempdir())
+
+    flores_root = cache_root / "flores200_dataset"
+    data_file = flores_root / "devtest" / f"{config}.devtest"
+
+    if not data_file.exists():
+        archive = cache_root / "flores200_dataset.tar.gz"
+        if not archive.exists():
+            cache_root.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(_FLORES_CDN, archive)
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(cache_root)
+
+    lines = data_file.read_text(encoding="utf-8").splitlines()
+    return [s.strip() for s in lines if s.strip()]
 
 
 # ---------------------------------------------------------------------------
