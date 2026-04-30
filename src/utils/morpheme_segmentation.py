@@ -36,6 +36,7 @@ expected path in the repository.
 
 from __future__ import annotations
 
+import csv
 import re
 import warnings
 from collections import Counter
@@ -86,9 +87,8 @@ def _load_morphynet(language: str, cache_dir: Path) -> dict[str, list[str]]:
 
         urllib.request.urlretrieve(url, tsv_path)
     lookup: dict[str, list[str]] = {}
-    with open(tsv_path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
+    with open(tsv_path, "r", encoding="utf-8", newline="") as f:
+        for parts in csv.reader(f, delimiter="\t"):
             if len(parts) < 4 or parts[3] == "-":
                 continue
             morphemes = [m for m in parts[3].split("|") if m]
@@ -111,8 +111,7 @@ def _collect_word_counts(
         for i, line in enumerate(f):
             if max_lines is not None and i >= max_lines:
                 break
-            for w in line.split():
-                counts[w] += 1
+            counts.update(line.split())
     return counts
 
 

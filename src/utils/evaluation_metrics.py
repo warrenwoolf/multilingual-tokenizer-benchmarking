@@ -55,14 +55,7 @@ def vocabulary_coverage(tokenizer, sentences: list[str]) -> float:
 
 def pct_continued_words(tokenizer, sentences: list[str]) -> float:
     """Fraction of words that are split into more than one token."""
-    total_words = 0
-    split_words = 0
-    for sentence in sentences:
-        words = sentence.split()
-        for word in words:
-            total_words += 1
-            if len(tokenizer.encode(word)) > 1:
-                split_words += 1
-    if total_words == 0:
+    words = [w for s in sentences for w in s.split()]
+    if not words:
         return 0.0
-    return split_words / total_words
+    return sum(1 for w in words if len(tokenizer.encode(w)) > 1) / len(words)
