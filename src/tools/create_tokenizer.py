@@ -6,11 +6,24 @@ import sys
 import traceback
 from pathlib import Path
 
+from src.utils.morpheme_segmentation import SUPPORTED_LANGUAGES as MORPHBPE_LANGUAGES
 from src.utils.tokenizer_algorithms import SUPPORTED_ALGORITHMS, train_tokenizer
 
 # ByT5 has a fixed ~259-id vocab (training is a no-op), so we only emit one
 # artifact per language regardless of the requested vocab sweep.
 SINGLE_SIZE_ALGORITHMS = {"byt5"}
+
+# Per-algorithm language allow-lists. Anything not listed here is treated
+# as language-agnostic. MorphBPE needs a per-language morpheme segmenter,
+# so we skip languages we don't have one for (notably Mandarin).
+ALGORITHM_LANGUAGE_ALLOWLIST: dict[str, frozenset[str]] = {
+    "morphbpe": frozenset(MORPHBPE_LANGUAGES),
+}
+
+
+def _algorithm_supports_language(algorithm: str, language: str) -> bool:
+    allowed = ALGORITHM_LANGUAGE_ALLOWLIST.get(algorithm)
+    return allowed is None or language in allowed
 
 
 def create_tokenizer_artifact(
@@ -38,6 +51,7 @@ def create_tokenizer_artifact(
         algorithm=algorithm,
         vocab_size=vocab_size,
         output_dir=artifact_dir,
+        language=language,
     )
     return artifact_dir
 
@@ -93,6 +107,9 @@ def generate_all_tokenizers(
 
     for lang, algo, vs in iter_jobs(languages, algorithms, vocab_sizes):
         label = f"{lang}/{algo}/v{vs if vs else 'fixed'}"
+        if not _algorithm_supports_language(algo, lang):
+            print(f"[{label}] SKIP: {algo} has no segmenter for {lang}")
+            continue
         corpus = data_dir / lang / "train.txt"
         if not corpus.exists():
             print(

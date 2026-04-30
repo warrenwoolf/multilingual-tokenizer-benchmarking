@@ -22,10 +22,10 @@ BRANCH = "claude/setup-paper-codebase-aKac5"  # change to "main" after merge
 REPO_DIR = "multilingual-tokenizer-benchmarking"
 
 LANGUAGES = "en,zh,tr"
-ALGORITHMS = "bpe,tiktoken,wordpiece,unigram,byt5"  # SuperBPE/MorphBPE need extra setup
+ALGORITHMS = "bpe,tiktoken,morphbpe,wordpiece,unigram,byt5"  # SuperBPE needs extra setup
 VOCAB_SIZES = "8000,16000,32000"                    # 64000 added if budget permits
-TRAIN_BUDGET_MB = 100                               # ~100 MB per language for a quick run
-EVAL_BUDGET_MB = 5
+MAX_TRAIN_ROWS = 100_000                            # rows per language for a quick run
+MAX_EVAL_ROWS = 5_000
 
 # Downstream LLM evaluation (heavy; needs a GPU runtime + extra deps).
 # Flip ON only on a GPU runtime; defaults are tuned for a smoke run.
@@ -42,7 +42,18 @@ if not os.path.isdir(REPO_DIR):
     !git clone --branch {BRANCH} {REPO_URL} {REPO_DIR}
 %cd {REPO_DIR}
 
-# 2. Install dependencies (editable so any tweaks take effect immediately)
+# 2. Persist HuggingFace token from Colab Secrets into tokens/hf_token
+try:
+    from google.colab import userdata as _userdata
+    _hf_token = _userdata.get('HF_TOKEN')
+    if _hf_token:
+        with open('tokens/hf_token', 'w') as _fh:
+            _fh.write(_hf_token)
+        os.environ['HF_TOKEN'] = _hf_token
+except Exception:
+    pass  # not running in Colab or secret not set
+
+# 3. Install dependencies (editable so any tweaks take effect immediately)
 !pip install -q -e .
 if RUN_LLM_EVAL:
     !pip install -q -e ".[llm]" wandb
@@ -68,7 +79,7 @@ if RUN_LLM_EVAL and WANDB_PROJECT:
         )
         WANDB_PROJECT = None
 
-# 3. Override the per-script config via env-var-friendly Python overrides.
+# 4. Override the per-script config via env-var-friendly Python overrides.
 #    Each script is config-only at the top, so a tiny shim keeps the run
 #    parameterized without editing the file in the repo.
 shim = f"""
@@ -80,8 +91,8 @@ from src.tools.download_data import download_all_languages
 download_all_languages(
     languages={LANGUAGES.split(',')!r},
     data_dir='data',
-    train_budget_mb={TRAIN_BUDGET_MB},
-    eval_budget_mb={EVAL_BUDGET_MB},
+    max_train_rows={MAX_TRAIN_ROWS},
+    max_eval_rows={MAX_EVAL_ROWS},
 )
 
 # --- train ---
@@ -125,7 +136,7 @@ with open("/tmp/run_pipeline.py", "w") as fh:
     fh.write(shim)
 !python /tmp/run_pipeline.py
 
-# 4. Display results
+# 5. Display results
 import pandas as pd
 df = pd.read_csv("results.csv")
 print(df.to_string(index=False))

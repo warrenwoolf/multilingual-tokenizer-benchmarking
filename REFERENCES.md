@@ -30,6 +30,12 @@ Papers, datasets, and reference implementations used in this benchmark.
 - **Paper:** Xue, Barua, Constant, Al-Rfou, Narang, Kale, Roberts & Raffel (2022). *ByT5: Towards a Token-Free Future with Pre-trained Byte-to-Byte Models*. [arXiv:2105.13626](https://arxiv.org/abs/2105.13626)
 - **Implementation:** [huggingface/transformers](https://github.com/huggingface/transformers) — `transformers.ByT5Tokenizer`. No training needed; each UTF-8 byte is a token ID.
 
+### MorphBPE
+- **Paper:** Asgari, El Kheir & Sadraei Javaheri (2025). *MorphBPE: A Morpho-Aware Tokenizer Bridging Linguistic Complexity for Efficient LLM Training Across Morphologies*. [arXiv:2502.00894](https://arxiv.org/abs/2502.00894)
+- **Official code:** [llm-lab-org/MorphBPE](https://github.com/llm-lab-org/MorphBPE) — empty placeholder at the time of writing, so we re-implement Algorithm 1 from scratch in `src/utils/morpheme_segmentation.py` + `src/utils/tokenizer_algorithms.py:_train_morphbpe`.
+- **Morpheme segmenter:** [Morfessor 2.0](https://github.com/aalto-speech/morfessor) (Virpioja et al. 2013, [paper](https://aaltodoc.aalto.fi/server/api/core/bitstreams/619206b3-7eef-4940-a2c9-89bf9e85c8b6/content)) — unsupervised, MDL-based, designed for agglutinative languages. Trained per-language on the same corpus used for the BPE step.
+- **Not to be confused with** [h9-tec/MorphBPE](https://github.com/h9-tec/MorphBPE), which is a different paper (Fanar, [arXiv:2501.13944](https://arxiv.org/abs/2501.13944)).
+
 ## Deferred to future work
 
 The following algorithms were scoped out of v1. Keeping citations here for the paper's Related Work section.
@@ -37,11 +43,6 @@ The following algorithms were scoped out of v1. Keeping citations here for the p
 ### MAGNET
 - **Paper:** Ahia, Kumar, Gonen, Hoffmann, Limisiewicz, Tsvetkov & Smith (2024). *MAGNET: Improving the Multilingual Fairness of Language Models with Adaptive Gradient-Based Tokenization*. [arXiv:2407.08818](https://arxiv.org/abs/2407.08818) — NeurIPS 2024.
 - **Status:** No public code release. MAGNET is architecture-level (gradient-based boundary predictors integrated with the LM), not a standalone vocab+merges tokenizer — it cannot be compared on fertility/coverage metrics without training a full LM.
-
-### MorphBPE
-- **Paper:** Asgari, El Kheir & Sadraei Javaheri (2025). *MorphBPE: A Morpho-Aware Tokenizer Bridging Linguistic Complexity for Efficient LLM Training Across Morphologies*. [arXiv:2502.00894](https://arxiv.org/abs/2502.00894)
-- **Official code:** [llm-lab-org/MorphBPE](https://github.com/llm-lab-org/MorphBPE)
-- **Not to be confused with** [h9-tec/MorphBPE](https://github.com/h9-tec/MorphBPE), which is a different paper (Fanar, [arXiv:2501.13944](https://arxiv.org/abs/2501.13944)).
 
 ### Byte-level BPE (GPT-2 style)
 - **Paper:** Radford et al. (2019). *Language Models are Unsupervised Multitask Learners* ([PDF](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)).

@@ -17,15 +17,15 @@ structure lives *inside* words rather than across whitespace.
 ## Algorithms
 
 v1 paper focus is on **BPE, SuperBPE, tiktoken-style byte-level BPE**, and
-(probably) **MorphBPE**. WordPiece, Unigram, and ByT5 are kept available as
-fallback / baselines.
+**MorphBPE**. WordPiece, Unigram, and ByT5 are kept available as fallback /
+baselines.
 
 | | Algorithm | Source |
 |---|---|---|
 | 1 | BPE | `tokenizers.models.BPE` |
 | 2 | SuperBPE | [PythonNut/superbpe](https://github.com/PythonNut/superbpe) (shell-out, opt-in) |
 | 3 | tiktoken-style BPE | byte-level BPE via `tokenizers` (GPT-2 / GPT-4 style) |
-| 4 | MorphBPE | [llm-lab-org/MorphBPE](https://github.com/llm-lab-org/MorphBPE) — stub, see notes |
+| 4 | MorphBPE | from-scratch implementation of [Asgari et al. 2025](https://arxiv.org/abs/2502.00894), Algorithm 1 — see notes |
 | 5 | WordPiece | `tokenizers.models.WordPiece` |
 | 6 | Unigram | `tokenizers.models.Unigram` |
 | 7 | ByT5 (byte-level baseline) | `transformers.ByT5Tokenizer` |
@@ -33,10 +33,19 @@ fallback / baselines.
 Out of v1 with reasons documented in [REFERENCES.md](REFERENCES.md): MAGNET
 (architecture-level; no public code).
 
-**MorphBPE notes.** Adapter is a stub. Wiring it up requires (a) cloning the
-official repo, (b) per-language morpheme segmenters (Morfessor for English /
-Turkish; Mandarin is super-analytic and arguably out of scope for MorphBPE
-since it lacks the inflectional morphology MorphBPE was designed to exploit).
+**MorphBPE notes.** Algorithm 1 says "merge the most frequent byte pair
+without crossing morpheme boundaries". We implement that by morpheme-
+segmenting the corpus first and joining morphemes with single spaces, then
+training standard HF BPE — the Whitespace pre-tokenizer guarantees no merge
+ever observes a cross-morpheme pair. The official `llm-lab-org/MorphBPE`
+repo was an empty placeholder at the time of writing, so this is a from-
+scratch implementation rather than a wrapper. Per-language segmenters
+(`src/utils/morpheme_segmentation.py`):
+
+- **English & Turkish:** unsupervised Morfessor 2.0 trained on the corpus.
+- **Mandarin:** not supported — Mandarin is super-analytic and lacks the
+  inflectional morphology MorphBPE was designed to exploit. The (zh,
+  morphbpe) sweep cell is auto-skipped by ``generate_tokenizers``.
 
 ## Languages & Data
 
