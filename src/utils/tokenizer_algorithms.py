@@ -226,12 +226,12 @@ def train_tokenizer(
 def _train_bpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
     from tokenizers import Tokenizer, decoders
     from tokenizers.models import BPE
-    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPre
     from tokenizers.trainers import BpeTrainer
 
     tok = Tokenizer(BPE(unk_token="<unk>"))
-    tok.pre_tokenizer = Whitespace()
-    tok.decoder = decoders.BPEDecoder()
+    tok.pre_tokenizer = ByteLevelPre(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
     trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
     tok.train(files=[str(corpus_path)], trainer=trainer)
     HFAdapter(tok, algorithm="bpe").save(output_dir)
@@ -317,13 +317,14 @@ def _train_morphbpe(
     filtering out any candidate merge whose pair spans a morpheme boundary.
     We approximate that by morpheme-segmenting the corpus first (each word
     becomes its whitespace-joined morphemes) and then training standard HF
-    BPE on the rewritten corpus.  The Whitespace pre-tokenizer guarantees
-    BPE never counts or merges a pair across a morpheme boundary during
-    training, which is equivalent to Algorithm 1 for the encode path.
+    BPE on the rewritten corpus.  The ByteLevel pre-tokenizer splits on
+    those inserted spaces, guaranteeing BPE never counts or merges a pair
+    across a morpheme boundary during training.
 
     Training guarantee: no cross-morpheme merge is ever *learned* because
-    the Whitespace pre-tokenizer cannot count pairs across the inserted
-    spaces.  This is equivalent to Algorithm 1 for the training path.
+    the ByteLevel pre-tokenizer splits on whitespace, so it cannot count
+    pairs across the inserted morpheme-boundary spaces.  This is equivalent
+    to Algorithm 1 for the training path.
 
     Inference caveat: at inference time words are presented without spaces,
     so BPE may cross morpheme boundaries by composing within-morpheme merges
@@ -332,21 +333,11 @@ def _train_morphbpe(
     merge candidates during training rather than rewriting the corpus; our
     preprocessing approximation is weaker on the inference side.
 
-    Decode limitation: the segmented training corpus does not distinguish
-    original word-boundary spaces from morpheme-boundary spaces, so the
-    learned tokenizer cannot reconstruct inter-word spaces on decode.
-    Single-word decode is lossless (morphemes concatenate correctly), but
-    multi-word decode drops spaces, e.g. "playing tennis" round-trips as
-    "playingtennis".  The BPB and fertility evaluation pipelines only call
-    encode(), so this does not affect benchmark results.  The paper's
-    in-training-filter approach avoids this by operating on the original
-    corpus; a future improvement would implement Algorithm 1 directly.
-
-    Note on end_of_word_suffix: we deliberately do NOT set this on the
-    BpeTrainer here.  The segmented corpus treats each morpheme as a
-    "word"; adding </w> to every morpheme-final character would make
-    inference-time tokenization incorrect (the </w> marker appears at
-    morpheme ends in training but not in raw words at inference).
+    Decode: the ByteLevel pre-tokenizer encodes each morpheme-boundary space
+    as the Ġ prefix on the following token.  The ByteLevel decoder reverses
+    this: Ġ-prefixed tokens within the decoded sequence become spaces, so
+    multi-word decode reconstructs inter-word spaces correctly, e.g.
+    "playing tennis" round-trips as "playing tennis".
 
     Per-language segmenters (src/utils/morpheme_segmentation.py):
       en — MorphyNet gold inflectional lookup (~650k entries, downloaded once).
@@ -359,7 +350,7 @@ def _train_morphbpe(
     from src.utils.morpheme_segmentation import segment_corpus
     from tokenizers import Tokenizer, decoders
     from tokenizers.models import BPE
-    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPre
     from tokenizers.trainers import BpeTrainer
 
     with tempfile.TemporaryDirectory(prefix="morphbpe_") as td:
@@ -367,8 +358,8 @@ def _train_morphbpe(
         segment_corpus(corpus_path, segmented, language=language, morphynet_cache_dir=morphynet_cache_dir)
 
         tok = Tokenizer(BPE(unk_token="<unk>"))
-        tok.pre_tokenizer = Whitespace()
-        tok.decoder = decoders.BPEDecoder()
+        tok.pre_tokenizer = ByteLevelPre(add_prefix_space=False)
+        tok.decoder = decoders.ByteLevel()
         trainer = BpeTrainer(
             vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS
         )
@@ -447,7 +438,11 @@ def _load_unigram(artifact_dir: Path) -> HFAdapter:
 
 
 def _load_superbpe(artifact_dir: Path) -> HFAdapter:
-    return _load_hf(artifact_dir, "superbpe")
+    from tokenizers import Tokenizer, decoders
+
+    tok = Tokenizer.from_file(str(artifact_dir / _TOKENIZER_FILENAME))
+    tok.decoder = decoders.ByteLevel()
+    return HFAdapter(tok, algorithm="superbpe")
 
 
 def _load_tiktoken(artifact_dir: Path) -> HFAdapter:
