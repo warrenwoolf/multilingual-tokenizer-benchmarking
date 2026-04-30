@@ -163,12 +163,14 @@ def test_unk_handling(trained_tokenizer):
         return
     unk_id = tok.token_to_id("<unk>")
     if unk_id is None:
-        # Adapter that doesn't declare <unk> (e.g. byte-level BPE) must still encode.
+        # No declared <unk>: tokenizer must still produce output (byte-level fallback).
         assert len(ids) > 0
     else:
-        # Either the rare codepoints map to <unk>, or the tokenizer
-        # has byte-level fallback built in.
-        assert len(ids) > 0
+        # Tokenizer has <unk>: rare codepoints that can't be encoded any other
+        # way must actually appear as UNK tokens, not silently vanish.
+        assert unk_id in ids, (
+            f"rare tag-space codepoints should produce <unk> (id={unk_id}), got ids={ids}"
+        )
 
 
 # ---------- MorphBPE -------------------------------------------------------

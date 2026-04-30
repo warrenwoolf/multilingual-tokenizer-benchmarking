@@ -81,7 +81,7 @@ def test_tokenize_corpus_bytes_per_row_is_sane(tiny_corpus, trained_bpe):
 
 
 def test_train_lm_runs_and_reduces_loss(tiny_corpus, trained_bpe, capsys):
-    """Train a tiny model for a handful of steps; assert no crash and finite loss."""
+    """Train a tiny model for a handful of steps; assert no crash, finite loss, and that loss decreases."""
     losses: list[float] = []
 
     def capture(msg):
@@ -96,8 +96,11 @@ def test_train_lm_runs_and_reduces_loss(tiny_corpus, trained_bpe, capsys):
         trained_bpe, tiny_corpus, TINY_CONFIG, log_fn=capture
     )
     assert train_seconds >= 0
-    assert losses, "expected at least one logged loss"
+    assert len(losses) >= 2, "expected multiple logged loss values to compare"
     assert all(math.isfinite(l) for l in losses)
+    assert losses[-1] < losses[0], (
+        f"expected loss to decrease over training, got {losses[0]:.4f} -> {losses[-1]:.4f}"
+    )
     # Sanity: parameter count is in the right ballpark for the tiny config.
     n = count_parameters(model)
     assert 10_000 < n < 5_000_000
