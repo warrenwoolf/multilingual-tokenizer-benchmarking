@@ -479,6 +479,20 @@ def train_lm_transformers(tokenizer, train_corpus_path: Path, cfg: LLMConfig, lo
     t0 = time.time()
     trainer.train()
     train_seconds = time.time() - t0
+
+    # Free Trainer internals (optimizer states, gradient scaler, etc.) immediately
+    # so they don't compete with the eval pass and subsequent runs for GPU memory.
+    del trainer
+    import gc
+    gc.collect()
+    try:
+        import torch as _torch
+        _torch.cuda.empty_cache()
+    except Exception:
+        pass
+    import shutil
+    shutil.rmtree(outdir, ignore_errors=True)
+
     # Wrap HF model to present the old interface
     wrapped = HFWrapper(hf_model)
     # Move model to device for downstream scoring
@@ -835,6 +849,18 @@ def train_and_evaluate(
                 log_fn("  uploaded model artifact to W&B")
             except Exception as exc:
                 log_fn(f"  W&B model artifact upload failed (continuing): {exc}")
+
+        # Explicitly release the model from GPU before returning so that the
+        # next run starts with a clean slate (Python GC alone won't flush the
+        # CUDA allocator cache).
+        import gc
+        del model
+        gc.collect()
+        try:
+            import torch as _torch
+            _torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         return out
     finally:
