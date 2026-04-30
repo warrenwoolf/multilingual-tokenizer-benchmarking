@@ -21,11 +21,10 @@ SUPERBPE_STAGE1_REGEX = (
 )
 SUPERBPE_STAGE2_REGEX = r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]{2,}[\r\n/]*| +(?!\S)"
 
-# Stage-2 byte budget default (50 MB). Stage-2 pretokens are paragraph-sized
-# because the regex doesn't split on letters, so cost is O(bytes × stage1_merges).
-# 200 MB was the previous default but OOMs Colab (~12 GB RAM) at vocab ≥ 8 k.
+# Stage-2 byte budget default (200 MB). Stage-2 pretokens are paragraph-sized
+# because the regex doesn't split on letters, so time cost is O(bytes × stage1_merges).
 # Override via SUPERBPE_STAGE2_BYTES env var.
-_DEFAULT_STAGE2_BYTES = 5 * 10**7
+_DEFAULT_STAGE2_BYTES = 2 * 10**8
 
 
 class SuperBPESetupError(RuntimeError):
