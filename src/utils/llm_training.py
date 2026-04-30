@@ -102,9 +102,9 @@ class LLMConfig:
 
     # Training
     train_tokens: int = 1_000_000_000  # ~Chinchilla-optimal for 50M params
-    batch_size: int = 32
-    learning_rate: float = 3e-4
-    min_lr: float = 3e-5
+    batch_size: int = 512  # fills A100 40GB with FlashAttention (F.sdpa); ~256K tok/step
+    learning_rate: float = 1e-3  # sqrt-scaled from 3e-4 @ bs=32: 3e-4 * sqrt(512/32) ≈ 1.2e-3
+    min_lr: float = 1e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
