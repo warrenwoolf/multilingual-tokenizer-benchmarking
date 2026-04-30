@@ -5,9 +5,14 @@ from __future__ import annotations
 import sys
 import traceback
 from pathlib import Path
+from typing import Any
 
 from src.utils.morpheme_segmentation import SUPPORTED_LANGUAGES as MORPHBPE_LANGUAGES
-from src.utils.tokenizer_algorithms import SUPPORTED_ALGORITHMS, train_tokenizer
+from src.utils.tokenizer_algorithms import (
+    SUPPORTED_ALGORITHMS,
+    train_tokenizer,
+    load_tokenizer,
+)
 
 # ByT5 has a fixed 256-byte vocab (training is a no-op), so we only emit one
 # artifact per language regardless of the requested vocab sweep.
@@ -57,6 +62,42 @@ def create_tokenizer_artifact(
         language=language,
     )
     return artifact_dir
+
+
+def _first_nonempty_line(path: Path) -> str:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            text = line.rstrip("\n\r")
+            if text.strip():
+                return text
+    raise ValueError(f"No non-empty training samples found in {path}")
+
+
+def _token_texts_for_ids(tokenizer: Any, token_ids: list[int]) -> list[str]:
+    if hasattr(tokenizer, "tokenizer"):
+        return [tokenizer.tokenizer.id_to_token(i) or f"<id:{i}>" for i in token_ids]
+    if hasattr(tokenizer, "_tok"):
+        return [str(t) for t in tokenizer._tok.convert_ids_to_tokens(token_ids)]
+    return [str(i) for i in token_ids]
+
+
+def _print_sample_roundtrip(artifact_dir: Path, algorithm: str, corpus_path: Path, label: str) -> None:
+    tokenizer = load_tokenizer(artifact_dir, algorithm)
+    source_text = _first_nonempty_line(corpus_path)
+    token_ids = tokenizer.encode(source_text)
+    token_texts = _token_texts_for_ids(tokenizer, token_ids)
+    detokenized = tokenizer.decode(token_ids)
+
+    print(f"[{label}] sample original: {source_text!r}")
+    print(f"[{label}] sample tokens: {token_texts}")
+    print(f"[{label}] sample detokenized: {detokenized!r}")
+
+    if detokenized != source_text:
+        raise ValueError(
+            "Detokenization mismatch for sample text "
+            f"(expected {source_text!r}, got {detokenized!r})"
+        )
+    print(f"[{label}] sample round-trip check: OK")
 
 
 def iter_jobs(
@@ -128,6 +169,12 @@ def generate_all_tokenizers(
                 vocab_size=vs,
                 output_dir=artifact_dir,
                 language=lang,
+            )
+            _print_sample_roundtrip(
+                artifact_dir=artifact,
+                algorithm=algo,
+                corpus_path=corpus,
+                label=label,
             )
         except Exception as exc:
             failures.append((lang, algo, vs, repr(exc)))

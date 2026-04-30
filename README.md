@@ -159,12 +159,14 @@ Paste [`colab.py`](colab.py) into a Google Colab cell and run.
 
 ### Optional: enable SuperBPE
 
-Requires Python 3.12 and a Rust toolchain.
+Requires a Rust toolchain. The official SuperBPE repo is cloned into an
+isolated checkout and its patched Rust-backed `tokenizers` dependency is
+built there, so the main environment stays clean.
 
 ```bash
 make install-superbpe
 export SUPERBPE_REPO=third_party/superbpe
-# then add "superbpe" to ALGORITHMS in generate_tokenizers.py
+# then keep "superbpe" in ALGORITHMS in generate_tokenizers.py
 ```
 
 ## Configuration

@@ -9,6 +9,11 @@ install:
 install-llm:
 	$(PY) -m pip install -e ".[llm]"
 
+install-superbpe:
+	@echo "Running SuperBPE installer script (may require git, cargo, rust, python3)"
+	set -e; \
+	bash ./scripts/install_superbpe.sh
+
 test:
 	$(PY) -m pytest tests/ -v
 

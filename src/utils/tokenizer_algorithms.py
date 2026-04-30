@@ -339,46 +339,27 @@ def _train_morphbpe(
 
 
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
-    """Native two-stage SuperBPE (Nut et al. 2025) via HF tokenizers.
+    """Train SuperBPE by delegating to the official PythonNut/superbpe repo.
 
-    Stage 1 — standard BPE with Whitespace pre-tokenizer (90% of vocab budget).
-              Merges are constrained to word boundaries.
-    Stage 2 — reseed from stage-1 vocab+merges, then continue training without
-              a pre-tokenizer so the BPE trainer sees spaces as ordinary
-              characters and can discover merges that cross word boundaries.
-
-    No external repo, Rust toolchain, or patched tokenizers fork is needed.
+    The previous in-process implementation has been removed because it was a
+    manual approximation. If that legacy code path is ever reintroduced, it
+    should fail loudly rather than silently diverge from the official repo.
     """
-    import json as _json
-    from tokenizers import Tokenizer, decoders
-    from tokenizers.models import BPE
-    from tokenizers.pre_tokenizers import Whitespace
-    from tokenizers.trainers import BpeTrainer
+    from src.tools.superbpe_runner import train_superbpe as _train_superbpe_official
 
-    stage1_size = int(vocab_size * 0.9)
+    try:
+        _train_superbpe_official(corpus_path=corpus_path, vocab_size=vocab_size, output_dir=output_dir)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "SuperBPE requires the official PythonNut/superbpe checkout with its Rust-backed tokenizers fork. "
+            "Run `make install-superbpe` or execute `scripts/install_superbpe.sh` first."
+        ) from exc
 
-    # Stage 1: word-boundary BPE.
-    tok1 = Tokenizer(BPE(unk_token="<unk>"))
-    tok1.pre_tokenizer = Whitespace()
-    tok1.decoder = decoders.BPEDecoder()
-    trainer1 = BpeTrainer(vocab_size=stage1_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
-    tok1.train(files=[str(corpus_path)], trainer=trainer1)
 
-    # Pull the stage-1 vocab and merges out of the serialised model so we can
-    # seed a fresh BPE that has no pre-tokenizer for stage 2.
-    s1 = _json.loads(tok1.to_str())
-    s1_vocab = s1["model"]["vocab"]                                    # dict[str, int]
-    s1_merges = [tuple(m) for m in s1["model"]["merges"]]  # list[(str, str)]
-
-    # Stage 2: cross-word extension.
-    tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges, unk_token="<unk>"))
-    tok2.decoder = decoders.BPEDecoder()
-    # No pre_tokenizer → spaces are treated as ordinary characters, allowing
-    # new merges to span word boundaries.
-    trainer2 = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
-    tok2.train(files=[str(corpus_path)], trainer=trainer2)
-
-    HFAdapter(tok2, algorithm="superbpe").save(output_dir)
+def _train_superbpe_legacy_manual(*_: object, **__: object) -> None:
+    raise RuntimeError(
+        "The old manual SuperBPE implementation has been removed. Use the official PythonNut/superbpe repo instead."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,15 @@ if not os.path.isdir(REPO_DIR):
     !git clone --branch {BRANCH} {REPO_URL} {REPO_DIR}
 %cd {REPO_DIR}
 
+# 1b. Install Rust for the official SuperBPE repo, which depends on the
+# patched Rust-backed tokenizers fork during training.
+!apt-get update -qq
+!apt-get install -y -qq build-essential curl
+!curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+os.environ["PATH"] = "/root/.cargo/bin:" + os.environ.get("PATH", "")
+!rustc --version
+!cargo --version
+
 # 2. Persist HuggingFace token from Colab Secrets into tokens/hf_token
 try:
     from google.colab import userdata as _userdata
@@ -57,6 +66,13 @@ except Exception:
 !pip install -q -e .
 if RUN_LLM_EVAL:
     !pip install -q -e ".[llm]" wandb
+
+# 3b. Install the official SuperBPE repo if requested. This pulls the patched
+# tokenizers submodule, builds its Rust-backed Python extension, and keeps it in
+# an isolated venv under third_party/superbpe.
+if "superbpe" in ALGORITHMS.split(","):
+    !chmod +x scripts/install_superbpe.sh
+    !SUPERBPE_REPO=third_party/superbpe ./scripts/install_superbpe.sh
 
 # 2b. Load the W&B API key from Colab Secrets if available, into tokens/wandb.token.
 #     Add a secret named WANDB_API_KEY in the Colab "key" sidebar before running.
