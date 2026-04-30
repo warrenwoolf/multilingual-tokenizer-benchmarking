@@ -84,9 +84,10 @@ def test_vocabulary_coverage_no_words_is_one():
 def test_vocabulary_coverage_byte_level_is_always_one():
     """Byte-level tokenizers represent every word without UNK.
 
-    The mock's get_vocab() returns {} (empty), so a raw vocab-membership
-    check would yield 0.0. The function must return 1.0 despite this,
-    proving it uses the is_byte_level path rather than vocab membership.
+    The vocab contains only individual byte characters as keys (realistic
+    for ByT5/tiktoken). No multi-character word will appear as a vocab key,
+    so a naive membership check would return 0.0 — the function must return
+    1.0 by recognising that every UTF-8 byte sequence is representable.
     """
 
     class ByteLevelTokenizer:
@@ -96,15 +97,14 @@ def test_vocabulary_coverage_byte_level_is_always_one():
             return list(text.encode("utf-8"))
 
         def get_vocab(self) -> dict:
-            # Empty: every word would be OOV under a vocab-membership check.
-            return {}
+            # Realistic byte-level vocab: one entry per byte value.
+            # Multi-character words (e.g. "hello") are not keys here.
+            return {chr(i): i for i in range(256)}
 
     tok = ByteLevelTokenizer()
-    # Plain ASCII word — nothing in vocab, but representable as bytes.
+    # "hello" has 5 chars — not a key in the byte vocab, but representable.
     assert vocabulary_coverage(tok, ["hello"]) == 1.0
-    # Multi-word sentence — all words OOV by vocab, all representable by bytes.
     assert vocabulary_coverage(tok, ["hi world"]) == 1.0
-    # Non-ASCII characters — still fully representable via UTF-8.
     assert vocabulary_coverage(tok, ["café naïve"]) == 1.0
 
 
