@@ -3,7 +3,9 @@
 Supported algorithms
 --------------------
 bpe        – standard Byte-Pair Encoding (Sennrich et al. 2016) via HF tokenizers
-superbpe   – SuperBPE two-stage training (Nut et al. 2025) via official scripts
+superbpe   – SuperBPE two-stage byte-level BPE (Nut et al. 2025): stage 1 with a
+             GPT-2-style word-boundary regex, stage 2 with a permissive regex that
+             allows merges across spaces (cross-word tokens)
 tiktoken   – tiktoken/GPT-style byte-level BPE (ByteLevel pre-tokenizer + BPE)
 morphbpe   – MorphBPE (Asgari et al. 2025): morpheme-segment the corpus first,
              then train standard BPE — see src/utils/morpheme_segmentation.py
@@ -338,37 +340,68 @@ def _train_morphbpe(
         HFAdapter(tok, algorithm="morphbpe").save(output_dir)
 
 
+# Stage-1 regex: GPT-2 / tiktoken multilingual word-boundary split.
+# Matches (in order): lowercase-led words, uppercase-led words, 1-3 digits,
+# optional-space + symbols, newline sequences, trailing whitespace, other whitespace.
+# Taken verbatim from PythonNut/superbpe scripts/train_tokenizer.sh.
+_SUPERBPE_STAGE1_REGEX = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# Stage-2 regex: permissive split that does NOT split on spaces before letters or
+# digits, so "hello world" stays as one BPE unit and merges can cross word
+# boundaries.  Only splits on: 1-3 digits, 2+ special chars, trailing spaces.
+# Taken verbatim from PythonNut/superbpe scripts/extend_tokenizer.sh.
+_SUPERBPE_STAGE2_REGEX = (
+    r"\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]{2,}[\r\n/]*"
+    r"| +(?!\S)"
+)
+
+
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
-    """Native two-stage SuperBPE (Nut et al. 2025) via HF tokenizers.
+    """Byte-level two-stage SuperBPE (Nut et al. 2025), matching the original
+    PythonNut/superbpe architecture.
 
-    Stage 1 — standard BPE with Whitespace pre-tokenizer (90% of vocab budget).
-              Merges are constrained to word boundaries.
-    Stage 2 — reseed from stage-1 vocab+merges, train on a short-segment corpus
-              (SEGMENT_WORDS words per line) with no pre-tokenizer so spaces are
-              ordinary characters and BPE can discover cross-word merges.
+    Both stages use Sequence([Split(regex), ByteLevel()]) as the pre-tokenizer —
+    the same byte-level BPE architecture as tiktoken/GPT-2.  The difference is
+    in the regex:
 
-    Why short segments?  FineWeb stores each document as one long line.  Without
-    a pre-tokenizer every document becomes a single BPE "word" — potentially
-    thousands of characters — making each merge step prohibitively slow.
-    Splitting into short segments keeps unit lengths comparable to stage-1 words
-    while still allowing merges across spaces within each segment.
+    Stage 1 — GPT-2-style regex splits on word boundaries; trains 90 % of the
+              vocab budget.
+    Stage 2 — permissive regex skips splits before letters/digits, so the BPE
+              trainer sees " hello world" as one unit and can learn cross-word
+              merges for the remaining 10 % of the vocab budget.
+
+    Stage 2 is seeded with stage-1 vocab + merges so it extends rather than
+    retrains from scratch.
     """
     import json as _json
-    import tempfile as _tempfile
-    from tokenizers import Tokenizer, decoders
+    from tokenizers import Regex, Tokenizer
+    from tokenizers import decoders as _decoders
+    from tokenizers import pre_tokenizers as _pre_tokenizers
     from tokenizers.models import BPE
-    from tokenizers.pre_tokenizers import Split, Whitespace
+    from tokenizers.pre_tokenizers import ByteLevel, Split
     from tokenizers.trainers import BpeTrainer
 
-    # 6 words ≈ 30–40 chars per segment: fast BPE, captures common phrases.
-    SEGMENT_WORDS = 6
+    def _pretok(regex: str):
+        return _pre_tokenizers.Sequence([
+            Split(pattern=Regex(regex), behavior="isolated", invert=False),
+            ByteLevel(add_prefix_space=False, trim_offsets=True, use_regex=False),
+        ])
 
     stage1_size = int(vocab_size * 0.9)
 
-    # Stage 1: word-boundary BPE.
-    tok1 = Tokenizer(BPE(unk_token="<unk>"))
-    tok1.pre_tokenizer = Whitespace()
-    tok1.decoder = decoders.BPEDecoder()
+    # Stage 1: word-boundary byte-level BPE.
+    tok1 = Tokenizer(BPE())
+    tok1.pre_tokenizer = _pretok(_SUPERBPE_STAGE1_REGEX)
+    tok1.decoder = _decoders.ByteLevel()
     trainer1 = BpeTrainer(vocab_size=stage1_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
     tok1.train(files=[str(corpus_path)], trainer=trainer1)
 
@@ -376,36 +409,19 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
     s1_vocab = s1["model"]["vocab"]
     s1_merges = [tuple(m) for m in s1["model"]["merges"]]
 
-    # Build stage-2 corpus: split each (long) document line into short segments
-    # so BPE "words" are bounded in length.  Spaces are kept inside segments so
-    # the trainer can merge across original word boundaries.
-    tmp = _tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, encoding="utf-8"
-    )
-    try:
-        with corpus_path.open("r", encoding="utf-8", errors="replace") as fin:
-            for line in fin:
-                words = line.split()
-                for i in range(0, len(words), SEGMENT_WORDS):
-                    seg = " ".join(words[i : i + SEGMENT_WORDS])
-                    if seg:
-                        tmp.write(seg + "\n")
-        tmp.close()
+    # Stage 2: cross-word byte-level BPE seeded from stage 1.
+    tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges))
+    tok2.pre_tokenizer = _pretok(_SUPERBPE_STAGE2_REGEX)
+    tok2.decoder = _decoders.ByteLevel()
+    trainer2 = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
+    tok2.train(files=[str(corpus_path)], trainer=trainer2)
 
-        # Stage 2: cross-word BPE seeded from stage 1.
-        # Split on newlines so the trailing \n of each segment is stripped before
-        # BPE sees it — otherwise \n leaks into the token vocabulary.
-        # Spaces inside each segment remain as ordinary characters, allowing
-        # merges to cross word boundaries.
-        tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges, unk_token="<unk>"))
-        tok2.pre_tokenizer = Split("\n", behavior="removed")
-        tok2.decoder = decoders.BPEDecoder()
-        trainer2 = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
-        tok2.train(files=[tmp.name], trainer=trainer2)
-    finally:
-        Path(tmp.name).unlink(missing_ok=True)
-
-    HFAdapter(tok2, algorithm="superbpe").save(output_dir)
+    HFAdapter(
+        tok2,
+        algorithm="superbpe",
+        special_tokens=DEFAULT_SPECIAL_TOKENS,
+        is_byte_level=True,
+    ).save(output_dir)
 
 
 # ---------------------------------------------------------------------------
