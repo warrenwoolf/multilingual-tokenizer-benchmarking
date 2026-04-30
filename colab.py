@@ -22,8 +22,8 @@ BRANCH = "main" # Change this if using an unmerged branch
 REPO_DIR = "multilingual-tokenizer-benchmarking"
 SUPERBPE_REPO = "third_party/superbpe"
 
-LANGUAGES = "en,zh,tr"
-ALGORITHMS = "bpe,superbpe,tiktoken,morphbpe,wordpiece,unigram,byt5"
+LANGUAGES = "en,zh,hu"
+ALGORITHMS = "bpe,superbpe,morphbpe"
 VOCAB_SIZES = "8000,16000,32000"                    # 64000 added if budget permits
 MAX_TRAIN_ROWS = 100_000                            # rows per language for a quick run
 MAX_EVAL_ROWS = 5_000
