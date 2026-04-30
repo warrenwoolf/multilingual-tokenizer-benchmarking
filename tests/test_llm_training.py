@@ -203,13 +203,8 @@ def test_tiny_corpus_too_small_raises(tmp_path, trained_bpe):
 def test_sample_batch_can_reach_last_valid_start():
     token_array = np.arange(10, dtype=np.int32)
     gen = torch.Generator().manual_seed(0)
-    seen_starts = set()
-    for _ in range(200):
-        x, _ = _sample_batch(token_array, batch_size=4, ctx_len=4, generator=gen)
-        seen_starts.update(int(v) for v in x[:, 0].tolist())
-
-    # For n=10 and ctx=4, valid starts are 0..5 inclusive.
-    assert 5 in seen_starts
+    with pytest.raises(RuntimeError, match="Manual sampling is removed"):
+        _sample_batch(token_array, batch_size=4, ctx_len=4, generator=gen)
 
 
 def test_tokenize_corpus_truncated_row_scales_source_bytes(tmp_path):

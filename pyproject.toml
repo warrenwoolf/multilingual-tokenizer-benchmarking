@@ -31,6 +31,11 @@ llm = [
     "numpy>=1.24",
     "wandb>=0.16",
 ]
+# Optional accelerators for faster training in Colab/GPU environments
+llm_accel = [
+    "accelerate>=0.20",
+    "deepspeed>=0.9",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

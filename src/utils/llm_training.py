@@ -195,94 +195,63 @@ def resolve_eos_id(tokenizer) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def _build_model(vocab_size: int, cfg: LLMConfig):
-    """Construct the GPT model. Imported lazily so torch is only required when used."""
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
 
-    class CausalSelfAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            assert cfg.d_model % cfg.n_heads == 0
-            self.n_heads = cfg.n_heads
-            self.d_head = cfg.d_model // cfg.n_heads
-            self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-            self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-            self.dropout = cfg.dropout
 
-        def forward(self, x):
-            B, T, C = x.shape
-            qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.d_head)
-            q, k, v = qkv.unbind(dim=2)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                is_causal=True,
-                dropout_p=self.dropout if self.training else 0.0,
-            )
-            out = out.transpose(1, 2).contiguous().view(B, T, C)
-            return self.proj(out)
 
-    class Block(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ln1 = nn.LayerNorm(cfg.d_model)
-            self.attn = CausalSelfAttention()
-            self.ln2 = nn.LayerNorm(cfg.d_model)
-            self.mlp = nn.Sequential(
-                nn.Linear(cfg.d_model, cfg.d_ff),
-                nn.GELU(),
-                nn.Linear(cfg.d_ff, cfg.d_model),
-            )
+def _build_hf_model(vocab_size: int, cfg: LLMConfig):
+    """Build a HuggingFace GPT2-style model matching our `LLMConfig`.
 
-        def forward(self, x):
-            x = x + self.attn(self.ln1(x))
-            x = x + self.mlp(self.ln2(x))
-            return x
+    Imported lazily so `transformers` is optional.
+    """
+    from transformers import GPT2Config, GPT2LMHeadModel
 
-    class GPT(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
-            self.pos_emb = nn.Embedding(cfg.ctx_len, cfg.d_model)
-            self.drop = nn.Dropout(cfg.dropout)
-            self.blocks = nn.ModuleList([Block() for _ in range(cfg.n_layers)])
-            self.ln_f = nn.LayerNorm(cfg.d_model)
-            self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
-            # Weight tying: lm_head shares the embedding matrix.
-            self.lm_head.weight = self.tok_emb.weight
-            self.apply(self._init_weights)
+    hf_cfg = GPT2Config(
+        vocab_size=vocab_size,
+        n_embd=cfg.d_model,
+        n_layer=cfg.n_layers,
+        n_head=cfg.n_heads,
+        n_positions=cfg.ctx_len,
+        resid_pdrop=cfg.dropout,
+        embd_pdrop=cfg.dropout,
+        attn_pdrop=cfg.dropout,
+    )
+    return GPT2LMHeadModel(hf_cfg)
 
-        @staticmethod
-        def _init_weights(m):
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
-        def forward(self, idx, targets=None):
-            B, T = idx.shape
-            pos = torch.arange(T, device=idx.device)
-            x = self.drop(self.tok_emb(idx) + self.pos_emb(pos)[None])
-            for blk in self.blocks:
-                x = blk(x)
-            x = self.ln_f(x)
-            logits = self.lm_head(x)
-            if targets is None:
-                return logits, None
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                reduction="mean",
-            )
-            return logits, loss
+class HFWrapper:
+    """Lightweight wrapper around a HF model exposing the small API used
+    elsewhere in this module: `.to()`, `.eval()`, `.train()`, `.state_dict()`
+    and `forward(idx, targets=None)` returning `(logits, loss)`.
+    This avoids importing `torch` at module import time.
+    """
+    def __init__(self, hf_model):
+        self.hf = hf_model
 
-    return GPT()
+    def to(self, *args, **kwargs):
+        self.hf.to(*args, **kwargs)
+        return self
+
+    def eval(self):
+        self.hf.eval()
+
+    def train(self, mode=True):
+        self.hf.train(mode)
+
+    def state_dict(self):
+        return self.hf.state_dict()
+
+    def parameters(self):
+        return self.hf.parameters()
+
+    def __call__(self, idx, targets=None):
+        return self.forward(idx, targets)
+
+    def forward(self, idx, targets=None):
+        if targets is None:
+            outputs = self.hf(input_ids=idx)
+            return outputs.logits, None
+        outputs = self.hf(input_ids=idx, labels=targets)
+        return outputs.logits, outputs.loss
 
 
 def count_parameters(model) -> int:
@@ -397,23 +366,138 @@ def _lr_at_step(step: int, total_steps: int, cfg: LLMConfig) -> float:
 
 def _sample_batch(token_array, batch_size: int, ctx_len: int, generator):
     """Randomly sample ``batch_size`` (input, target) sequences of length ctx_len."""
+    raise RuntimeError("Manual sampling is removed; training uses HuggingFace Trainer")
+
+
+class _WindowDataset:
+    """A lightweight Dataset that returns dicts {'input_ids', 'labels'}
+    for Trainer. Windows are materialized on demand to keep memory usage low.
+    """
+    def __init__(self, token_array, starts, ctx_len: int):
+        # token_array: numpy.ndarray
+        # starts: numpy.ndarray of start indices
+        self.token_array = token_array
+        self.starts = starts
+        self.ctx_len = int(ctx_len)
+
+    def __len__(self):
+        return int(self.starts.shape[0])
+
+    def __getitem__(self, idx):
+        s = int(self.starts[idx])
+        arr = self.token_array
+        x = arr[s : s + self.ctx_len]
+        y = arr[s + 1 : s + 1 + self.ctx_len]
+        import torch
+
+        return {"input_ids": torch.from_numpy(x).long(), "labels": torch.from_numpy(y).long()}
+
+
+def train_lm_transformers(tokenizer, train_corpus_path: Path, cfg: LLMConfig, log_fn=print, wandb_run=None):
+    """Train using HuggingFace `transformers.Trainer` and return the same
+    result tuple as `train_lm()` for compatibility.
+    """
+    # Lazy imports
     import numpy as np
     import torch
+    from transformers import TrainingArguments, Trainer, TrainerCallback
 
-    n = token_array.shape[0]
-    # Each sample needs ctx_len + 1 contiguous tokens (input + shifted target).
-    high = n - ctx_len
-    if high <= 0:
+    log_fn("  using HuggingFace Trainer path")
+
+    # Tokenize (same as manual path)
+    eos_id = resolve_eos_id(tokenizer)
+    train_corpus = tokenize_corpus(tokenizer, train_corpus_path, max_tokens=cfg.train_tokens, eos_id=eos_id)
+    train_ids = train_corpus.ids
+
+    if train_corpus.n_tokens < cfg.ctx_len + 2:
         raise RuntimeError(
-            f"Token stream too short ({n} tokens) for ctx_len={ctx_len}; "
-            "increase the training corpus or shrink ctx_len."
+            f"Train corpus only produced {train_corpus.n_tokens} tokens; "
+            f"need at least ctx_len+2={cfg.ctx_len + 2}."
         )
-    starts = torch.randint(0, high, (batch_size,), generator=generator).numpy()
-    inputs = np.stack([token_array[s : s + ctx_len] for s in starts])
-    targets = np.stack([token_array[s + 1 : s + 1 + ctx_len] for s in starts])
-    x = torch.from_numpy(inputs).long()
-    y = torch.from_numpy(targets).long()
-    return x, y
+
+    # Compute training steps to match existing budget
+    tokens_per_step = cfg.batch_size * cfg.ctx_len
+    total_steps = max(1, cfg.train_tokens // tokens_per_step)
+    log_fn(f"  training (HF Trainer): {total_steps} steps × {tokens_per_step:,} tokens/step")
+
+    # Prepare starts array (one start per sample)
+    n = train_ids.shape[0]
+    high = n - cfg.ctx_len
+    if high <= 0:
+        raise RuntimeError("Token stream too short for ctx_len")
+    total_samples = total_steps * cfg.batch_size
+    rng = np.random.RandomState(cfg.seed)
+    starts = rng.randint(0, high, size=total_samples, dtype=np.int64)
+
+    # Dataset that yields windows on demand
+    ds = _WindowDataset(train_ids, starts, cfg.ctx_len)
+
+    # Build HF model and wrap for later evaluation compatibility
+    hf_model = _build_hf_model(tokenizer.vocab_size, cfg)
+
+    # TrainingArguments
+    import tempfile
+    outdir = tempfile.mkdtemp(prefix="hf-trainer-")
+    per_device_bs = cfg.batch_size
+    fp16 = False
+    device = resolve_device(cfg.device)
+    amp_dtype = resolve_amp_dtype(cfg.dtype, device)
+    if amp_dtype is not None and amp_dtype == torch.float16:
+        fp16 = True
+
+    training_args = TrainingArguments(
+        output_dir=outdir,
+        per_device_train_batch_size=per_device_bs,
+        max_steps=total_steps,
+        learning_rate=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+        warmup_steps=cfg.warmup_steps,
+        logging_steps=max(1, total_steps // 100),
+        remove_unused_columns=False,
+        fp16=fp16,
+        gradient_accumulation_steps=1,
+        optim="adamw_torch",
+        report_to=["wandb"] if wandb_run is not None else [],
+    )
+
+    class _LossLoggingCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            loss = logs.get("loss")
+            lr = logs.get("learning_rate")
+            if loss is None:
+                return
+            step = int(getattr(state, "global_step", 0))
+            if lr is None:
+                log_fn(f"    step {step:>5}/{total_steps}  loss={float(loss):.4f}")
+            else:
+                log_fn(f"    step {step:>5}/{total_steps}  loss={float(loss):.4f}  lr={float(lr):.2e}")
+
+    def collate_fn(batch):
+        # batch is a list of dicts; stack tensors
+        import torch
+
+        input_ids = torch.stack([b["input_ids"] for b in batch])
+        labels = torch.stack([b["labels"] for b in batch])
+        return {"input_ids": input_ids, "labels": labels}
+
+    trainer = Trainer(
+        model=hf_model,
+        args=training_args,
+        train_dataset=ds,
+        data_collator=collate_fn,
+        callbacks=[_LossLoggingCallback()],
+    )
+
+    t0 = time.time()
+    trainer.train()
+    train_seconds = time.time() - t0
+    # Wrap HF model to present the old interface
+    wrapped = HFWrapper(hf_model)
+    # Move model to device for downstream scoring
+    wrapped.to(device)
+    return wrapped, device, amp_dtype, train_seconds, train_corpus
 
 
 def _init_wandb(cfg: LLMConfig, extra_config: dict | None = None):
@@ -448,102 +532,8 @@ def train_lm(
     Returns the trained model + the device + the autocast dtype + train wall time.
     Logs per-step ``train/loss`` and ``train/lr`` to ``wandb_run`` if provided.
     """
-    import numpy as np
-    import torch
-
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    device = resolve_device(cfg.device)
-    amp_dtype = resolve_amp_dtype(cfg.dtype, device)
-
-    log_fn(f"  device={device} amp_dtype={amp_dtype}")
-    log_fn(f"  tokenizing train corpus (cap = {cfg.train_tokens:,} tokens) ...")
-    t0 = time.time()
-    eos_id = resolve_eos_id(tokenizer)
-    train_corpus = tokenize_corpus(
-        tokenizer,
-        train_corpus_path,
-        max_tokens=cfg.train_tokens,
-        eos_id=eos_id,
-    )
-    log_fn(
-        f"  tokenized {train_corpus.n_tokens:,} train tokens "
-        f"from {train_corpus.rows:,} rows "
-        f"({train_corpus.bytes_per_row:.1f} bytes/row, "
-        f"{train_corpus.tokens_per_row:.2f} tokens/row) "
-        f"in {time.time() - t0:.1f}s"
-    )
-
-    if train_corpus.n_tokens < cfg.ctx_len + 2:
-        raise RuntimeError(
-            f"Train corpus only produced {train_corpus.n_tokens} tokens; "
-            f"need at least ctx_len+2={cfg.ctx_len + 2}."
-        )
-
-    vocab_size = tokenizer.vocab_size
-    model = _build_model(vocab_size, cfg).to(device)
-    n_params = count_parameters(model)
-    log_fn(f"  model: vocab={vocab_size:,} params={n_params:,}")
-    if wandb_run is not None:
-        wandb_run.summary["param_count"] = n_params
-        wandb_run.summary["vocab_size"] = vocab_size
-        wandb_run.summary["train_tokens_actual"] = train_corpus.n_tokens
-        wandb_run.summary["train_rows"] = train_corpus.rows
-        wandb_run.summary["train_bytes_per_row"] = train_corpus.bytes_per_row
-        wandb_run.summary["train_tokens_per_row"] = train_corpus.tokens_per_row
-    train_ids = train_corpus.ids
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.learning_rate,
-        betas=(cfg.beta1, cfg.beta2),
-        weight_decay=cfg.weight_decay,
-    )
-
-    tokens_per_step = cfg.batch_size * cfg.ctx_len
-    total_steps = max(1, cfg.train_tokens // tokens_per_step)
-    log_fn(f"  training: {total_steps} steps × {tokens_per_step:,} tokens/step")
-
-    gen = torch.Generator().manual_seed(cfg.seed)
-    model.train()
-    t_start = time.time()
-    stdout_every = max(1, total_steps // 20)
-    for step in range(total_steps):
-        lr = _lr_at_step(step, total_steps, cfg)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
-        x, y = _sample_batch(train_ids, cfg.batch_size, cfg.ctx_len, gen)
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        if amp_dtype is not None:
-            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
-                _, loss = model(x, y)
-        else:
-            _, loss = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
-
-        loss_val = loss.item()
-        if wandb_run is not None and (step % cfg.log_every == 0 or step == total_steps - 1):
-            wandb_run.log(
-                {
-                    "train/loss": loss_val,
-                    "train/lr": lr,
-                    "train/tokens_seen": (step + 1) * tokens_per_step,
-                },
-                step=step,
-            )
-        if step == 0 or (step + 1) % stdout_every == 0 or step == total_steps - 1:
-            log_fn(f"    step {step + 1:>5}/{total_steps}  loss={loss_val:.4f}  lr={lr:.2e}")
-
-    train_seconds = time.time() - t_start
-    log_fn(f"  trained in {train_seconds:.1f}s")
-    if wandb_run is not None:
-        wandb_run.summary["train_seconds"] = train_seconds
-    return model, device, amp_dtype, train_seconds, train_corpus
+    # Always use the HuggingFace Trainer path.
+    return train_lm_transformers(tokenizer, train_corpus_path, cfg, log_fn=log_fn, wandb_run=wandb_run)
 
 
 # ---------------------------------------------------------------------------
