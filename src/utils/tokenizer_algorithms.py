@@ -49,6 +49,7 @@ DEFAULT_SPECIAL_TOKENS = ["<pad>", "<unk>", "<s>", "</s>"]
 
 _TOKENIZER_FILENAME = "tokenizer.json"
 _CONFIG_FILENAME = "config.json"
+_MORPHEME_LOOKUP_FILENAME = "morpheme_lookup.json"
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +176,100 @@ class ByT5Adapter:
         from transformers import ByT5Tokenizer
 
         self._tok = ByT5Tokenizer()
+
+
+@dataclass
+class MorphBPEAdapter:
+    """Wraps a ByteLevel BPE tokenizer with inference-time morpheme segmentation.
+
+    encode() segments each word into morphemes before tokenizing, so the
+    inference distribution matches the morpheme-segmented training corpus and
+    no cross-morpheme tokens are produced at inference time.
+
+    decode() returns morpheme-split text (spaces at morpheme boundaries).
+    This is intentional: faithful round-trip is not required for BPB
+    measurement, and the byte denominator in BPB is always taken from the
+    original (unsegmented) text, not from the decoded output.
+    """
+
+    tokenizer: Any  # tokenizers.Tokenizer
+    language: str
+    lookup: dict = field(repr=False)  # word → [morpheme, ...]
+    algorithm: str = "morphbpe"
+    special_tokens: list[str] = field(default_factory=lambda: list(DEFAULT_SPECIAL_TOKENS))
+    is_byte_level: bool = False
+    _seg_cache: dict = field(default_factory=dict, repr=False)
+
+    def _segmenter(self, word: str) -> list[str]:
+        return self.lookup.get(word, [word])
+
+    def encode(self, text: str) -> list[int]:
+        if text == "":
+            return []
+        from src.utils.morpheme_segmentation import _segment_word
+
+        words = text.split()
+        pieces: list[str] = []
+        for w in words:
+            pieces.extend(_segment_word(self._segmenter, w, self._seg_cache))
+        return list(self.tokenizer.encode(" ".join(pieces)).ids)
+
+    def decode(self, ids: list[int]) -> str:
+        return self.tokenizer.decode(list(ids), skip_special_tokens=False)
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        return [self.encode(t) for t in texts]
+
+    def get_vocab(self) -> dict[str, int]:
+        return self.tokenizer.get_vocab()
+
+    @property
+    def vocab_size(self) -> int:
+        return self.tokenizer.get_vocab_size()
+
+    def token_to_id(self, token: str) -> int | None:
+        return self.tokenizer.token_to_id(token)
+
+    def save(self, path: Path) -> None:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self.tokenizer.save(str(path / _TOKENIZER_FILENAME))
+        (path / _CONFIG_FILENAME).write_text(
+            json.dumps(
+                {
+                    "algorithm": self.algorithm,
+                    "special_tokens": self.special_tokens,
+                    "is_byte_level": self.is_byte_level,
+                    "language": self.language,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (path / _MORPHEME_LOOKUP_FILENAME).write_text(
+            json.dumps(self.lookup),
+            encoding="utf-8",
+        )
+
+    def __getstate__(self) -> dict:
+        return {
+            "tokenizer_json": self.tokenizer.to_str(),
+            "language": self.language,
+            "lookup": self.lookup,
+            "algorithm": self.algorithm,
+            "special_tokens": self.special_tokens,
+            "is_byte_level": self.is_byte_level,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        from tokenizers import Tokenizer
+
+        self.tokenizer = Tokenizer.from_str(state["tokenizer_json"])
+        self.language = state["language"]
+        self.lookup = state["lookup"]
+        self.algorithm = state["algorithm"]
+        self.special_tokens = state["special_tokens"]
+        self.is_byte_level = state["is_byte_level"]
+        self._seg_cache = {}
 
 
 # ---------------------------------------------------------------------------
@@ -323,39 +418,47 @@ def _train_morphbpe(
 
     Training guarantee: no cross-morpheme merge is ever *learned* because
     the ByteLevel pre-tokenizer splits on whitespace, so it cannot count
-    pairs across the inserted morpheme-boundary spaces.  This is equivalent
-    to Algorithm 1 for the training path.
+    pairs across the inserted morpheme-boundary spaces.
 
-    Inference caveat: at inference time words are presented without spaces,
-    so BPE may cross morpheme boundaries by composing within-morpheme merges
-    (e.g. 'run'+'n'+'ing' merges produce 'ning' which straddles the n|ing
-    boundary).  The paper's inline-filter approach avoids this by filtering
-    merge candidates during training rather than rewriting the corpus; our
-    preprocessing approximation is weaker on the inference side.
+    Inference: encode() in MorphBPEAdapter segments each word at inference
+    time using the same MorphyNet lookup, so the inference distribution
+    matches training and no cross-morpheme tokens are produced.  The lookup
+    is persisted in the artifact (morpheme_lookup.json) so load_tokenizer
+    can reconstruct the adapter without network access.
 
-    Decode: the ByteLevel pre-tokenizer encodes each morpheme-boundary space
-    as the Ġ prefix on the following token.  The ByteLevel decoder reverses
-    this: Ġ-prefixed tokens within the decoded sequence become spaces, so
-    multi-word decode reconstructs inter-word spaces correctly, e.g.
-    "playing tennis" round-trips as "playing tennis".
+    Approximation note: Algorithm 1 trains on the original (unsegmented)
+    corpus and filters cross-morpheme merge candidates inline.  Our approach
+    trains on the segmented corpus, which places Ġ on every post-morpheme-
+    boundary token rather than only on word-initial tokens.  The two
+    approaches produce different merge tables and different BPB values, but
+    both enforce morpheme boundaries and both give valid, comparable BPB.
 
     Per-language segmenters (src/utils/morpheme_segmentation.py):
       en — MorphyNet gold inflectional lookup (~650k entries, downloaded once).
-      hu — Morfessor 2.0 trained unsupervisedly on the corpus.
+      hu — MorphyNet gold inflectional lookup (~1M entries, downloaded once).
 
     The official llm-lab-org/MorphBPE repo was an empty placeholder at the
     time of writing, so this is a from-scratch implementation of the
     paper's algorithm rather than a wrapper around official code.
     """
-    from src.utils.morpheme_segmentation import segment_corpus
+    from src.utils.morpheme_segmentation import (
+        MORPHYNET_DEFAULT_CACHE,
+        _load_morphynet,
+        segment_corpus,
+    )
     from tokenizers import Tokenizer, decoders
     from tokenizers.models import BPE
     from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPre
     from tokenizers.trainers import BpeTrainer
 
+    cache_dir = Path(morphynet_cache_dir) if morphynet_cache_dir is not None else MORPHYNET_DEFAULT_CACHE
+
     with tempfile.TemporaryDirectory(prefix="morphbpe_") as td:
         segmented = Path(td) / "segmented.txt"
+        # segment_corpus validates the language and raises NotImplementedError for
+        # unsupported ones (e.g. zh) before we attempt to load the MorphyNet lookup.
         segment_corpus(corpus_path, segmented, language=language, morphynet_cache_dir=morphynet_cache_dir)
+        lookup = _load_morphynet(language, cache_dir)
 
         tok = Tokenizer(BPE(unk_token="<unk>"))
         tok.pre_tokenizer = ByteLevelPre(add_prefix_space=False)
@@ -364,7 +467,7 @@ def _train_morphbpe(
             vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS
         )
         tok.train(files=[str(segmented)], trainer=trainer)
-        HFAdapter(tok, algorithm="morphbpe").save(output_dir)
+        MorphBPEAdapter(tokenizer=tok, language=language, lookup=lookup).save(output_dir)
 
 
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
@@ -457,8 +560,22 @@ def _load_tiktoken(artifact_dir: Path) -> HFAdapter:
     )
 
 
-def _load_morphbpe(artifact_dir: Path) -> HFAdapter:
-    return _load_hf(artifact_dir, "morphbpe")
+def _load_morphbpe(artifact_dir: Path) -> MorphBPEAdapter:
+    from tokenizers import Tokenizer
+
+    tok_path = artifact_dir / _TOKENIZER_FILENAME
+    if not tok_path.exists():
+        raise FileNotFoundError(f"No {_TOKENIZER_FILENAME} in {artifact_dir}")
+    tok = Tokenizer.from_file(str(tok_path))
+
+    config = json.loads((artifact_dir / _CONFIG_FILENAME).read_text(encoding="utf-8"))
+
+    lookup_path = artifact_dir / _MORPHEME_LOOKUP_FILENAME
+    if not lookup_path.exists():
+        raise FileNotFoundError(f"No {_MORPHEME_LOOKUP_FILENAME} in {artifact_dir}")
+    lookup = json.loads(lookup_path.read_text(encoding="utf-8"))
+
+    return MorphBPEAdapter(tokenizer=tok, language=config["language"], lookup=lookup)
 
 
 def _load_byt5(artifact_dir: Path) -> ByT5Adapter:
