@@ -22,7 +22,7 @@ SUPERBPE_STAGE1_REGEX = (
 SUPERBPE_STAGE2_REGEX = r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]{2,}[\r\n/]*| +(?!\S)"
 
 # Stage-2 byte budget default (200 MB). Stage-2 pretokens are paragraph-sized
-# because the regex doesn't split on letters, so cost is O(bytes × stage1_merges).
+# because the regex doesn't split on letters, so time cost is O(bytes × stage1_merges).
 # Override via SUPERBPE_STAGE2_BYTES env var.
 _DEFAULT_STAGE2_BYTES = 2 * 10**8
 
@@ -96,11 +96,14 @@ def _prepare_superbpe_corpus(src: Path, dst: Path) -> None:
     doesn't split on letters), disproportionately slowing merge computation.
     We replicate the original paper's top-1% truncation by computing the 99th
     percentile of line lengths and capping any line that exceeds it.
-    """
-    import statistics
 
-    lines = src.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    lengths = [len(line) for line in lines]
+    Uses two streaming passes to avoid holding the entire corpus in RAM.
+    """
+    # Pass 1: collect lengths only (ints, not strings)
+    lengths = []
+    with src.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            lengths.append(len(line))
 
     if not lengths:
         dst.write_text("", encoding="utf-8")
@@ -109,24 +112,25 @@ def _prepare_superbpe_corpus(src: Path, dst: Path) -> None:
     lengths_sorted = sorted(lengths)
     p99_idx = max(0, int(len(lengths_sorted) * 0.99) - 1)
     threshold = lengths_sorted[p99_idx]
+    del lengths_sorted
 
+    # Pass 2: stream-copy, truncating long lines in place
     truncated = 0
-    out_lines = []
-    for line in lines:
-        if len(line) > threshold:
-            line = line[:threshold].rstrip() + "\n"
-            truncated += 1
-        out_lines.append(line)
+    total = len(lengths)
+    total_chars = sum(lengths)
+    del lengths
 
-    dst.write_text("".join(out_lines), encoding="utf-8")
+    with src.open(encoding="utf-8", errors="replace") as fin, dst.open("w", encoding="utf-8") as fout:
+        for line in fin:
+            if len(line) > threshold:
+                line = line[:threshold].rstrip() + "\n"
+                truncated += 1
+            fout.write(line)
 
-    total = len(lines)
-    max_len = max(lengths)
-    mean_len = statistics.mean(lengths)
+    mean_len = total_chars / total if total else 0
     print(
         f"[superbpe corpus] {total} documents — "
         f"p99 threshold {threshold:,} chars, "
-        f"max {max_len:,} chars, "
         f"mean {mean_len:.0f} chars, "
         f"truncated {truncated} ({truncated / total:.1%})"
     )

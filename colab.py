@@ -57,11 +57,18 @@ os.environ["SUPERBPE_REPO"] = SUPERBPE_REPO
 
 # 1b. Install Rust for the official SuperBPE repo, which depends on the
 # patched Rust-backed tokenizers fork during training.
-!apt-get update -qq
-!apt-get install -y -qq build-essential curl python3-venv
-!curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+# Prepend cargo bin first so the which-check below sees a previously installed rustc.
 os.environ["PATH"] = "/root/.cargo/bin:" + os.environ.get("PATH", "")
-import textwrap
+import shutil
+_rust_present = shutil.which("rustc") is not None
+if not _rust_present:
+    print("[colab] Rust not found — installing build-essential, curl, and rustup...", flush=True)
+    !apt-get update -qq
+    !apt-get install -y -qq build-essential curl python3-venv
+    !curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+else:
+    print(f"[colab] Rust already installed ({shutil.which('rustc')}), skipping rustup.", flush=True)
+
 try:
     r = subprocess.run(["rustc", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     print(f"[colab] rustc: {r.stdout.strip()}")
@@ -96,31 +103,35 @@ if RUN_LLM_EVAL:
 # tokenizers submodule, builds its Rust-backed Python extension, and keeps it in
 # an isolated venv under third_party/superbpe.
 if "superbpe" in ALGORITHMS.split(","):
-    !chmod +x scripts/install_superbpe.sh
-    os.environ["PYTHON"] = sys.executable
-    print("[colab] Installing official SuperBPE repo... (logs suppressed)", flush=True)
-    try:
-        res = subprocess.run(["bash", "scripts/install_superbpe.sh"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if res.returncode != 0:
-            print("[colab] SuperBPE install failed — showing captured output:")
-            print(res.stdout)
-            raise subprocess.CalledProcessError(res.returncode, res.args)
-        else:
-            # keep a minimal success line
-            print("[colab] SuperBPE installed successfully.")
-    except subprocess.CalledProcessError:
-        raise
     superbpe_repo_abs = os.path.abspath(SUPERBPE_REPO)
-    if not os.path.isdir(superbpe_repo_abs):
-        raise RuntimeError(
-            f"SuperBPE install did not create {superbpe_repo_abs}. "
-            "Check the output above for the failing command."
-        )
-    if not os.path.isfile(os.path.join(superbpe_repo_abs, ".venv", "bin", "python")):
-        raise RuntimeError(
-            f"SuperBPE checkout exists at {superbpe_repo_abs}, but its virtualenv is missing. "
-            "The install script likely failed while building the patched tokenizers wheel."
-        )
+    _superbpe_venv_py = os.path.join(superbpe_repo_abs, ".venv", "bin", "python")
+    if os.path.isfile(_superbpe_venv_py):
+        print(f"[colab] SuperBPE venv already present at {superbpe_repo_abs}, skipping install.", flush=True)
+    else:
+        !chmod +x scripts/install_superbpe.sh
+        os.environ["PYTHON"] = sys.executable
+        print("[colab] Installing official SuperBPE repo... (logs suppressed)", flush=True)
+        try:
+            res = subprocess.run(["bash", "scripts/install_superbpe.sh"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if res.returncode != 0:
+                print("[colab] SuperBPE install failed — showing captured output:")
+                print(res.stdout)
+                raise subprocess.CalledProcessError(res.returncode, res.args)
+            else:
+                # keep a minimal success line
+                print("[colab] SuperBPE installed successfully.")
+        except subprocess.CalledProcessError:
+            raise
+        if not os.path.isdir(superbpe_repo_abs):
+            raise RuntimeError(
+                f"SuperBPE install did not create {superbpe_repo_abs}. "
+                "Check the output above for the failing command."
+            )
+        if not os.path.isfile(_superbpe_venv_py):
+            raise RuntimeError(
+                f"SuperBPE checkout exists at {superbpe_repo_abs}, but its virtualenv is missing. "
+                "The install script likely failed while building the patched tokenizers wheel."
+            )
 
 # 2b. Load the W&B API key from Colab Secrets if available, into tokens/wandb.token.
 #     Add a secret named WANDB_API_KEY in the Colab "key" sidebar before running.
