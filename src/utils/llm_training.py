@@ -168,6 +168,28 @@ def resolve_amp_dtype(spec: str, device) -> "torch.dtype | None":
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[spec]
 
 
+def resolve_eos_id(tokenizer) -> int | None:
+    """Best-effort EOS id lookup across adapter types.
+
+    Returns None when no EOS-like token is available.
+    """
+    # Prefer canonical EOS spellings used across our adapters.
+    for tok in ("</s>", "<|endoftext|>", "<eos>"):
+        try:
+            tid = tokenizer.token_to_id(tok)
+        except Exception:
+            tid = None
+        if tid is not None:
+            return int(tid)
+
+    # Fallback for transformer-backed adapters exposing eos_token_id.
+    tok_obj = getattr(tokenizer, "_tok", None)
+    eos_tid = getattr(tok_obj, "eos_token_id", None)
+    if eos_tid is not None:
+        return int(eos_tid)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -330,21 +352,25 @@ def tokenize_corpus(
     rows = 0
     src_bytes = 0
     for line in _iter_lines(corpus_path):
-        ids = tokenizer.encode(line)
+        text_ids = tokenizer.encode(line)
+        if not text_ids:
+            continue
+        ids = text_ids
         if eos_id is not None:
             ids = ids + [eos_id]
-        if not ids:
-            continue
         if max_tokens is not None and total_tokens + len(ids) > max_tokens:
             ids = ids[: max_tokens - total_tokens]
             if ids:
                 chunks.append(np.asarray(ids, dtype=np.int32))
                 total_tokens += len(ids)
                 rows += 1
-                # Approximate byte contribution proportional to the kept
-                # token fraction for the truncated final row. Rough but
-                # bounded by one row's worth, which is negligible.
-                src_bytes += len(line.encode("utf-8"))
+                line_bytes = len(line.encode("utf-8"))
+                if eos_id is None:
+                    kept_text_tokens = len(ids)
+                else:
+                    kept_text_tokens = min(len(text_ids), len(ids))
+                frac = kept_text_tokens / max(1, len(text_ids))
+                src_bytes += int(round(line_bytes * frac))
             break
         chunks.append(np.asarray(ids, dtype=np.int32))
         total_tokens += len(ids)
@@ -376,7 +402,7 @@ def _sample_batch(token_array, batch_size: int, ctx_len: int, generator):
 
     n = token_array.shape[0]
     # Each sample needs ctx_len + 1 contiguous tokens (input + shifted target).
-    high = n - ctx_len - 1
+    high = n - ctx_len
     if high <= 0:
         raise RuntimeError(
             f"Token stream too short ({n} tokens) for ctx_len={ctx_len}; "
@@ -433,10 +459,12 @@ def train_lm(
     log_fn(f"  device={device} amp_dtype={amp_dtype}")
     log_fn(f"  tokenizing train corpus (cap = {cfg.train_tokens:,} tokens) ...")
     t0 = time.time()
+    eos_id = resolve_eos_id(tokenizer)
     train_corpus = tokenize_corpus(
         tokenizer,
         train_corpus_path,
         max_tokens=cfg.train_tokens,
+        eos_id=eos_id,
     )
     log_fn(
         f"  tokenized {train_corpus.n_tokens:,} train tokens "
@@ -593,7 +621,8 @@ def evaluate_perplexity(
     log_fn=print,
 ) -> dict:
     """Compute per-token perplexity and bits-per-byte on ``eval_corpus_path``."""
-    corpus = tokenize_corpus(tokenizer, eval_corpus_path, max_tokens=None)
+    eos_id = resolve_eos_id(tokenizer)
+    corpus = tokenize_corpus(tokenizer, eval_corpus_path, max_tokens=None, eos_id=eos_id)
     log_fn(
         f"  eval (test set): {corpus.n_tokens:,} tokens, "
         f"{corpus.rows:,} rows, "
@@ -626,14 +655,22 @@ def evaluate_perplexity_on_sentences(
     cleaned = [s.strip() for s in sentences if s and s.strip()]
     if not cleaned:
         raise RuntimeError(f"No non-empty sentences in '{label}' eval set.")
-    joined = " ".join(cleaned)
-    ids = tokenizer.encode(joined)
-    if not ids:
+    eos_id = resolve_eos_id(tokenizer)
+    all_ids: list[int] = []
+    for sentence in cleaned:
+        s_ids = tokenizer.encode(sentence)
+        if not s_ids:
+            continue
+        all_ids.extend(s_ids)
+        if eos_id is not None:
+            all_ids.append(eos_id)
+    if not all_ids:
         raise RuntimeError(f"Tokenizer produced 0 ids for '{label}' eval text.")
+    joined = " ".join(cleaned)
     corpus = TokenizedCorpus(
-        ids=np.asarray(ids, dtype=np.int32),
+        ids=np.asarray(all_ids, dtype=np.int32),
         rows=len(cleaned),
-        source_bytes=sum(len(s.encode("utf-8")) for s in cleaned),
+        source_bytes=len(joined.encode("utf-8")),
     )
     log_fn(
         f"  eval ({label}): {corpus.n_tokens:,} tokens, "

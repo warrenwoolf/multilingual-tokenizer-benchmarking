@@ -10,20 +10,26 @@ Skipped when torch is not installed — the LLM eval is an optional extra.
 from __future__ import annotations
 
 import math
+import csv
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 torch = pytest.importorskip("torch")  # whole module is gated on torch availability
 
 from src.utils.llm_training import (
     LLMConfig,
+    TokenizedCorpus,
+    _sample_batch,
     count_parameters,
     evaluate_perplexity,
+    evaluate_perplexity_on_sentences,
     tokenize_corpus,
     train_and_evaluate,
     train_lm,
 )
+from src.tools.train_llm import CSV_FIELDNAMES, train_all_llms
 from src.utils.tokenizer_algorithms import load_tokenizer, train_tokenizer
 
 
@@ -192,3 +198,158 @@ def test_tiny_corpus_too_small_raises(tmp_path, trained_bpe):
     cfg = LLMConfig(**{**vars(TINY_CONFIG), "ctx_len": 64})
     with pytest.raises(RuntimeError, match="Train corpus only produced"):
         train_lm(trained_bpe, short, cfg, log_fn=lambda *a, **k: None)
+
+
+def test_sample_batch_can_reach_last_valid_start():
+    token_array = np.arange(10, dtype=np.int32)
+    gen = torch.Generator().manual_seed(0)
+    seen_starts = set()
+    for _ in range(200):
+        x, _ = _sample_batch(token_array, batch_size=4, ctx_len=4, generator=gen)
+        seen_starts.update(int(v) for v in x[:, 0].tolist())
+
+    # For n=10 and ctx=4, valid starts are 0..5 inclusive.
+    assert 5 in seen_starts
+
+
+def test_tokenize_corpus_truncated_row_scales_source_bytes(tmp_path):
+    class CharTok:
+        def encode(self, text: str) -> list[int]:
+            return [1] * len(text)
+
+    path = tmp_path / "row.txt"
+    path.write_text("abcd\n", encoding="utf-8")
+    corpus = tokenize_corpus(CharTok(), path, max_tokens=2)
+
+    assert corpus.n_tokens == 2
+    assert corpus.source_bytes == 2
+
+
+def test_evaluate_perplexity_passes_eos_id(monkeypatch, tmp_path):
+    calls = {"eos_id": None}
+
+    class Tok:
+        vocab_size = 16
+
+        def token_to_id(self, token: str):
+            return 7 if token == "</s>" else None
+
+    def fake_tokenize(tokenizer, corpus_path, max_tokens=None, eos_id=None):
+        calls["eos_id"] = eos_id
+        return TokenizedCorpus(ids=np.arange(20, dtype=np.int32), rows=1, source_bytes=20)
+
+    monkeypatch.setattr("src.utils.llm_training.tokenize_corpus", fake_tokenize)
+    monkeypatch.setattr(
+        "src.utils.llm_training._score_corpus",
+        lambda model, corpus, cfg, device, amp_dtype: {"perplexity": 1.0, "bits_per_byte": 1.0, "mean_nll_per_token": 0.0, "eval_tokens_scored": 1, "eval_bytes_scored": 1.0, "eval_rows_scored": 1.0, "eval_bytes_per_row": 1.0},
+    )
+
+    cfg = LLMConfig(device="cpu", dtype="fp32", ctx_len=4)
+    p = tmp_path / "eval.txt"
+    p.write_text("hello\n", encoding="utf-8")
+    evaluate_perplexity(object(), Tok(), p, cfg, device=torch.device("cpu"), amp_dtype=None, log_fn=lambda *a, **k: None)
+
+    assert calls["eos_id"] == 7
+
+
+def test_train_lm_passes_eos_id(monkeypatch, tmp_path):
+    calls = {"eos_id": None}
+
+    class Tok:
+        vocab_size = 32
+
+        def token_to_id(self, token: str):
+            return 3 if token == "</s>" else None
+
+    def fake_tokenize(tokenizer, corpus_path, max_tokens=None, eos_id=None):
+        calls["eos_id"] = eos_id
+        ids = (np.arange(50, dtype=np.int32) % 32).astype(np.int32)
+        return TokenizedCorpus(ids=ids, rows=2, source_bytes=50)
+
+    monkeypatch.setattr("src.utils.llm_training.tokenize_corpus", fake_tokenize)
+    cfg = LLMConfig(
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        d_ff=64,
+        ctx_len=8,
+        train_tokens=64,
+        batch_size=4,
+        warmup_steps=1,
+        device="cpu",
+        dtype="fp32",
+    )
+    p = tmp_path / "train.txt"
+    p.write_text("hello\n", encoding="utf-8")
+    train_lm(Tok(), p, cfg, log_fn=lambda *a, **k: None)
+
+    assert calls["eos_id"] == 3
+
+
+def test_flores_sentence_eval_uses_joined_bytes_and_eos(monkeypatch):
+    captured = {}
+
+    class Tok:
+        def token_to_id(self, token: str):
+            return 9 if token == "</s>" else None
+
+        def encode(self, text: str):
+            return [ord(c) % 17 for c in text]
+
+    def fake_score(model, corpus, cfg, device, amp_dtype):
+        captured["rows"] = corpus.rows
+        captured["source_bytes"] = corpus.source_bytes
+        captured["ids"] = corpus.ids.tolist()
+        return {"perplexity": 1.0, "bits_per_byte": 1.0, "mean_nll_per_token": 0.0, "eval_tokens_scored": 1, "eval_bytes_scored": 1.0, "eval_rows_scored": 1.0, "eval_bytes_per_row": 1.0}
+
+    monkeypatch.setattr("src.utils.llm_training._score_corpus", fake_score)
+    cfg = LLMConfig(device="cpu", dtype="fp32", ctx_len=4)
+    sents = ["ab", "cd"]
+    evaluate_perplexity_on_sentences(
+        model=object(),
+        tokenizer=Tok(),
+        sentences=sents,
+        cfg=cfg,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        log_fn=lambda *a, **k: None,
+    )
+
+    # "ab cd" includes one inserted separator byte.
+    assert captured["source_bytes"] == len("ab cd".encode("utf-8"))
+    assert captured["rows"] == 2
+    # eos id appended after each sentence.
+    assert captured["ids"][2] == 9
+    assert captured["ids"][-1] == 9
+
+
+def test_train_all_llms_skips_completed_rows(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    (data_dir / "en").mkdir(parents=True)
+    (data_dir / "en" / "train.txt").write_text("hello\n", encoding="utf-8")
+    (data_dir / "en" / "eval.txt").write_text("hello\n", encoding="utf-8")
+
+    artifact_dir = tmp_path / "artifacts"
+    (artifact_dir / "en_bpe_v512").mkdir(parents=True)
+
+    results_path = tmp_path / "llm_results.csv"
+    with results_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        row = {k: "" for k in CSV_FIELDNAMES}
+        row["language"] = "en"
+        row["algorithm"] = "bpe"
+        row["vocab_size"] = "512"
+        writer.writerow(row)
+
+    def should_not_run(**kwargs):
+        raise AssertionError("completed artifact should have been skipped")
+
+    monkeypatch.setattr("src.tools.train_llm.train_and_evaluate_artifact", should_not_run)
+
+    cfg = LLMConfig(train_tokens=128, batch_size=4, ctx_len=8, device="cpu", dtype="fp32")
+    train_all_llms(data_dir, artifact_dir, results_path, cfg, continue_on_error=True)
+
+    with results_path.open("r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1

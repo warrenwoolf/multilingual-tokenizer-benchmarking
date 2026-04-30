@@ -173,15 +173,32 @@ def train_all_llms(
     print(json.dumps(asdict(config), indent=2))
 
     results_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = results_path.open("w", encoding="utf-8", newline="")
+    completed: set[tuple[str, str, int]] = set()
+    append_mode = results_path.exists() and results_path.stat().st_size > 0
+    if append_mode:
+        with results_path.open("r", encoding="utf-8", newline="") as rf:
+            reader = csv.DictReader(rf)
+            for row in reader:
+                try:
+                    completed.add((row["language"], row["algorithm"], int(row["vocab_size"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+
+    pending = [(a, l, g, v) for (a, l, g, v) in artifacts if (l, g, v) not in completed]
+    skipped_completed = len(artifacts) - len(pending)
+    if skipped_completed:
+        print(f"Skipping {skipped_completed} already completed artifact(s) in existing CSV")
+
+    fh = results_path.open("a" if append_mode else "w", encoding="utf-8", newline="")
     writer = csv.DictWriter(fh, fieldnames=CSV_FIELDNAMES)
-    writer.writeheader()
-    fh.flush()
+    if not append_mode:
+        writer.writeheader()
+        fh.flush()
 
     successes = 0
     failures: list[tuple[str, str]] = []
     try:
-        for artifact, lang, algo, vs in artifacts:
+        for artifact, lang, algo, vs in pending:
             train_corpus = data_dir / lang / "train.txt"
             eval_corpus = data_dir / lang / "eval.txt"
             if not train_corpus.exists() or not eval_corpus.exists():
