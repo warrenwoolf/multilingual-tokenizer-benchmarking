@@ -140,4 +140,12 @@ with open("/tmp/run_pipeline.py", "w") as fh:
 import pandas as pd
 df = pd.read_csv("results.csv")
 print(df.to_string(index=False))
+
+# Also display LLM results if the downstream eval ran. Look at
+# `train_bytes_per_row` to sanity-check the per-language data slice.
+if RUN_LLM_EVAL and os.path.exists("llm_results.csv"):
+    print("\n=== LLM results (PPL + BPB) ===")
+    llm_df = pd.read_csv("llm_results.csv")
+    print(llm_df.to_string(index=False))
+
 df  # last expression renders as a Colab table

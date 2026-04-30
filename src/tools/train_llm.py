@@ -30,20 +30,28 @@ CSV_FIELDNAMES = [
     "algorithm",
     "vocab_size",
     "param_count",
-    "train_tokens",
+    "train_tokens_budget",
+    "train_tokens_actual",
+    "train_rows",
+    "train_bytes_per_row",
+    "train_tokens_per_row",
     "train_seconds",
     # In-domain (FineWeb test split)
     "test_perplexity",
     "test_bits_per_byte",
     "test_mean_nll_per_token",
     "test_eval_tokens_scored",
+    "test_eval_rows_scored",
     "test_eval_bytes_scored",
+    "test_eval_bytes_per_row",
     # Out-of-distribution (FLORES-200 devtest)
     "flores_perplexity",
     "flores_bits_per_byte",
     "flores_mean_nll_per_token",
     "flores_eval_tokens_scored",
+    "flores_eval_rows_scored",
     "flores_eval_bytes_scored",
+    "flores_eval_bytes_per_row",
 ]
 
 
@@ -71,31 +79,45 @@ def train_and_evaluate_artifact(
             "algorithm": algorithm,
             "artifact": Path(artifact_dir).name,
         },
+        tokenizer_artifact_dir=Path(artifact_dir),
+        artifact_name=Path(artifact_dir).name,
     )
 
 
-def _format_row(lang: str, algo: str, vs: int, train_tokens: int, result: dict) -> dict:
+def _format_row(lang: str, algo: str, vs: int, train_tokens_budget: int, result: dict) -> dict:
     def _fmt(key: str, fmt: str = ".4f") -> str:
         v = result.get(key)
         return format(v, fmt) if isinstance(v, (int, float)) else ""
+
+    def _int(key: str) -> str:
+        v = result.get(key)
+        return str(int(v)) if isinstance(v, (int, float)) else ""
 
     return {
         "language": lang,
         "algorithm": algo,
         "vocab_size": vs,
         "param_count": result.get("param_count", ""),
-        "train_tokens": train_tokens,
+        "train_tokens_budget": train_tokens_budget,
+        "train_tokens_actual": _int("train_tokens_actual"),
+        "train_rows": _int("train_rows"),
+        "train_bytes_per_row": _fmt("train_bytes_per_row", ".2f"),
+        "train_tokens_per_row": _fmt("train_tokens_per_row", ".3f"),
         "train_seconds": _fmt("train_seconds", ".1f"),
         "test_perplexity": _fmt("test_perplexity"),
         "test_bits_per_byte": _fmt("test_bits_per_byte"),
         "test_mean_nll_per_token": _fmt("test_mean_nll_per_token"),
-        "test_eval_tokens_scored": result.get("test_eval_tokens_scored", ""),
+        "test_eval_tokens_scored": _int("test_eval_tokens_scored"),
+        "test_eval_rows_scored": _fmt("test_eval_rows_scored", ".1f"),
         "test_eval_bytes_scored": _fmt("test_eval_bytes_scored", ".0f"),
+        "test_eval_bytes_per_row": _fmt("test_eval_bytes_per_row", ".2f"),
         "flores_perplexity": _fmt("flores_perplexity"),
         "flores_bits_per_byte": _fmt("flores_bits_per_byte"),
         "flores_mean_nll_per_token": _fmt("flores_mean_nll_per_token"),
-        "flores_eval_tokens_scored": result.get("flores_eval_tokens_scored", ""),
+        "flores_eval_tokens_scored": _int("flores_eval_tokens_scored"),
+        "flores_eval_rows_scored": _fmt("flores_eval_rows_scored", ".1f"),
         "flores_eval_bytes_scored": _fmt("flores_eval_bytes_scored", ".0f"),
+        "flores_eval_bytes_per_row": _fmt("flores_eval_bytes_per_row", ".2f"),
     }
 
 

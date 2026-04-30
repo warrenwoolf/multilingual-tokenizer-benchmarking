@@ -124,6 +124,11 @@ class LLMConfig:
     wandb_entity: str | None = None
     wandb_run_name: str | None = None  # filled in by orchestrator per artifact
     wandb_tags: list[str] = field(default_factory=list)
+    # If True (and wandb is enabled), upload the tokenizer artifact dir at run
+    # start and the trained model state_dict at run end. Each model is ~200MB
+    # at 50M params; turn this off for large sweeps if storage is a concern.
+    wandb_log_tokenizer_artifact: bool = True
+    wandb_log_model_artifact: bool = True
 
 
 # Where to look for a W&B API key on disk if WANDB_API_KEY is not set.
@@ -275,39 +280,78 @@ def _iter_lines(path: Path) -> Iterator[str]:
                 yield line
 
 
+@dataclass
+class TokenizedCorpus:
+    """A tokenized corpus along with the row + byte counts it was built from.
+
+    The byte count (``source_bytes``) is the raw UTF-8 byte length of the
+    *consumed* portion of the source text — i.e. it accounts for early stops
+    on ``max_tokens``. This is what BPB normalizes by, and dividing by
+    ``rows`` gives the bytes-per-row sanity-check indicator.
+    """
+
+    ids: object  # numpy.ndarray of int32, kept opaque to avoid eager import
+    rows: int
+    source_bytes: int
+
+    @property
+    def n_tokens(self) -> int:
+        return int(self.ids.shape[0])
+
+    @property
+    def bytes_per_row(self) -> float:
+        return self.source_bytes / self.rows if self.rows else 0.0
+
+    @property
+    def tokens_per_row(self) -> float:
+        return self.n_tokens / self.rows if self.rows else 0.0
+
+
 def tokenize_corpus(
     tokenizer,
     corpus_path: Path,
     max_tokens: int | None = None,
     eos_id: int | None = None,
-) -> "numpy.ndarray":
-    """Tokenize a text corpus into a 1-D int32 array of token ids.
+) -> TokenizedCorpus:
+    """Tokenize a text corpus into ids + row/byte accounting.
 
     Reads line-by-line so the source text never lives fully in memory; stops
     early once ``max_tokens`` ids have been collected. ``eos_id`` is appended
     after each document if provided, separating documents in the packed stream.
+
+    The byte count is summed from the consumed lines (UTF-8) so callers can
+    log a ``bytes_per_row`` indicator that's tied to what was actually used,
+    not to the on-disk file size.
     """
     import numpy as np
 
     chunks: list[np.ndarray] = []
-    total = 0
+    total_tokens = 0
+    rows = 0
+    src_bytes = 0
     for line in _iter_lines(corpus_path):
         ids = tokenizer.encode(line)
         if eos_id is not None:
             ids = ids + [eos_id]
         if not ids:
             continue
-        if max_tokens is not None and total + len(ids) > max_tokens:
-            ids = ids[: max_tokens - total]
+        if max_tokens is not None and total_tokens + len(ids) > max_tokens:
+            ids = ids[: max_tokens - total_tokens]
             if ids:
                 chunks.append(np.asarray(ids, dtype=np.int32))
-                total += len(ids)
+                total_tokens += len(ids)
+                rows += 1
+                # Approximate byte contribution proportional to the kept
+                # token fraction for the truncated final row. Rough but
+                # bounded by one row's worth, which is negligible.
+                src_bytes += len(line.encode("utf-8"))
             break
         chunks.append(np.asarray(ids, dtype=np.int32))
-        total += len(ids)
-    if not chunks:
-        return np.zeros(0, dtype=np.int32)
-    return np.concatenate(chunks)
+        total_tokens += len(ids)
+        rows += 1
+        src_bytes += len(line.encode("utf-8"))
+    arr = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int32)
+    return TokenizedCorpus(ids=arr, rows=rows, source_bytes=src_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -389,16 +433,22 @@ def train_lm(
     log_fn(f"  device={device} amp_dtype={amp_dtype}")
     log_fn(f"  tokenizing train corpus (cap = {cfg.train_tokens:,} tokens) ...")
     t0 = time.time()
-    train_ids = tokenize_corpus(
+    train_corpus = tokenize_corpus(
         tokenizer,
         train_corpus_path,
         max_tokens=cfg.train_tokens,
     )
-    log_fn(f"  tokenized {train_ids.shape[0]:,} train tokens in {time.time() - t0:.1f}s")
+    log_fn(
+        f"  tokenized {train_corpus.n_tokens:,} train tokens "
+        f"from {train_corpus.rows:,} rows "
+        f"({train_corpus.bytes_per_row:.1f} bytes/row, "
+        f"{train_corpus.tokens_per_row:.2f} tokens/row) "
+        f"in {time.time() - t0:.1f}s"
+    )
 
-    if train_ids.shape[0] < cfg.ctx_len + 2:
+    if train_corpus.n_tokens < cfg.ctx_len + 2:
         raise RuntimeError(
-            f"Train corpus only produced {train_ids.shape[0]} tokens; "
+            f"Train corpus only produced {train_corpus.n_tokens} tokens; "
             f"need at least ctx_len+2={cfg.ctx_len + 2}."
         )
 
@@ -409,7 +459,11 @@ def train_lm(
     if wandb_run is not None:
         wandb_run.summary["param_count"] = n_params
         wandb_run.summary["vocab_size"] = vocab_size
-        wandb_run.summary["train_tokens_actual"] = int(train_ids.shape[0])
+        wandb_run.summary["train_tokens_actual"] = train_corpus.n_tokens
+        wandb_run.summary["train_rows"] = train_corpus.rows
+        wandb_run.summary["train_bytes_per_row"] = train_corpus.bytes_per_row
+        wandb_run.summary["train_tokens_per_row"] = train_corpus.tokens_per_row
+    train_ids = train_corpus.ids
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -461,7 +515,7 @@ def train_lm(
     log_fn(f"  trained in {train_seconds:.1f}s")
     if wandb_run is not None:
         wandb_run.summary["train_seconds"] = train_seconds
-    return model, device, amp_dtype, train_seconds
+    return model, device, amp_dtype, train_seconds, train_corpus
 
 
 # ---------------------------------------------------------------------------
@@ -469,17 +523,19 @@ def train_lm(
 # ---------------------------------------------------------------------------
 
 
-def _score_ids(model, eval_ids, total_bytes: int, cfg: LLMConfig, device, amp_dtype) -> dict:
-    """Score a 1-D token id array under ``model`` and return PPL/BPB metrics.
+def _score_corpus(model, corpus: TokenizedCorpus, cfg: LLMConfig, device, amp_dtype) -> dict:
+    """Score a TokenizedCorpus under ``model`` and return PPL/BPB metrics.
 
-    ``total_bytes`` is the raw UTF-8 byte count of the source text; we use it
-    to normalize cross-entropy into bits-per-byte (the cross-tokenizer-
-    comparable metric). If we drop a tail of < ctx_len ids that don't fill a
-    final window, we scale the byte count proportionally so BPB remains a
-    per-byte-of-scored-text quantity.
+    BPB normalises by the source byte count from the corpus. If we drop a
+    tail of < ctx_len ids that don't fill a final window, we scale the byte
+    count and the row count proportionally so each metric remains
+    per-(byte/row)-of-scored-text.
     """
     import torch
 
+    eval_ids = corpus.ids
+    total_bytes = corpus.source_bytes
+    total_rows = corpus.rows
     if eval_ids.shape[0] < 2:
         raise RuntimeError("Need at least 2 tokens to compute perplexity.")
 
@@ -513,6 +569,7 @@ def _score_ids(model, eval_ids, total_bytes: int, cfg: LLMConfig, device, amp_dt
 
     fraction_scored = total_targets / max(1, eval_ids.shape[0] - 1)
     scored_bytes = total_bytes * fraction_scored
+    scored_rows = total_rows * fraction_scored
     bits_per_byte = (total_loss_sum / scored_bytes) / math.log(2) if scored_bytes > 0 else float("nan")
 
     return {
@@ -521,6 +578,8 @@ def _score_ids(model, eval_ids, total_bytes: int, cfg: LLMConfig, device, amp_dt
         "bits_per_byte": bits_per_byte,
         "eval_tokens_scored": total_targets,
         "eval_bytes_scored": scored_bytes,
+        "eval_rows_scored": scored_rows,
+        "eval_bytes_per_row": (scored_bytes / scored_rows) if scored_rows else 0.0,
     }
 
 
@@ -534,10 +593,15 @@ def evaluate_perplexity(
     log_fn=print,
 ) -> dict:
     """Compute per-token perplexity and bits-per-byte on ``eval_corpus_path``."""
-    eval_ids = tokenize_corpus(tokenizer, eval_corpus_path, max_tokens=None)
-    eval_bytes = Path(eval_corpus_path).stat().st_size
-    log_fn(f"  eval (test set): {eval_ids.shape[0]:,} tokens, {eval_bytes:,} bytes")
-    return _score_ids(model, eval_ids, eval_bytes, cfg, device, amp_dtype)
+    corpus = tokenize_corpus(tokenizer, eval_corpus_path, max_tokens=None)
+    log_fn(
+        f"  eval (test set): {corpus.n_tokens:,} tokens, "
+        f"{corpus.rows:,} rows, "
+        f"{corpus.source_bytes:,} bytes "
+        f"({corpus.bytes_per_row:.1f} bytes/row, "
+        f"{corpus.tokens_per_row:.2f} tokens/row)"
+    )
+    return _score_corpus(model, corpus, cfg, device, amp_dtype)
 
 
 def evaluate_perplexity_on_sentences(
@@ -552,24 +616,33 @@ def evaluate_perplexity_on_sentences(
 ) -> dict:
     """Score a list of sentences (e.g. FLORES devtest) under ``model``.
 
+    Each sentence counts as one row for the bytes-per-row indicator.
     Sentences are concatenated with a single space separator before tokenizing,
     so the windowed scoring sees a continuous stream — one FLORES sentence is
-    too short to fill a 512-token context on its own. Cross-sentence prediction
-    is unrealistic but the resulting numbers are consistent across tokenizers,
-    which is all we need for the comparison.
+    too short to fill a 512-token context on its own.
     """
     import numpy as np
 
-    joined = " ".join(s.strip() for s in sentences if s and s.strip())
-    if not joined:
+    cleaned = [s.strip() for s in sentences if s and s.strip()]
+    if not cleaned:
         raise RuntimeError(f"No non-empty sentences in '{label}' eval set.")
+    joined = " ".join(cleaned)
     ids = tokenizer.encode(joined)
     if not ids:
         raise RuntimeError(f"Tokenizer produced 0 ids for '{label}' eval text.")
-    eval_ids = np.asarray(ids, dtype=np.int32)
-    eval_bytes = len(joined.encode("utf-8"))
-    log_fn(f"  eval ({label}): {eval_ids.shape[0]:,} tokens, {eval_bytes:,} bytes")
-    return _score_ids(model, eval_ids, eval_bytes, cfg, device, amp_dtype)
+    corpus = TokenizedCorpus(
+        ids=np.asarray(ids, dtype=np.int32),
+        rows=len(cleaned),
+        source_bytes=sum(len(s.encode("utf-8")) for s in cleaned),
+    )
+    log_fn(
+        f"  eval ({label}): {corpus.n_tokens:,} tokens, "
+        f"{corpus.rows:,} rows, "
+        f"{corpus.source_bytes:,} bytes "
+        f"({corpus.bytes_per_row:.1f} bytes/row, "
+        f"{corpus.tokens_per_row:.2f} tokens/row)"
+    )
+    return _score_corpus(model, corpus, cfg, device, amp_dtype)
 
 
 def load_flores_devtest(language: str) -> list[str]:
@@ -596,6 +669,37 @@ def load_flores_devtest(language: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _log_tokenizer_artifact(wandb_run, tokenizer_artifact_dir: Path, name: str) -> None:
+    """Upload the tokenizer artifact directory as a W&B Artifact (type=tokenizer)."""
+    import wandb
+
+    art = wandb.Artifact(name=name, type="tokenizer")
+    art.add_dir(str(tokenizer_artifact_dir))
+    wandb_run.log_artifact(art)
+
+
+def _log_model_artifact(wandb_run, model, cfg: LLMConfig, vocab_size: int, name: str) -> None:
+    """Save the trained model state_dict + config to a W&B Artifact (type=model)."""
+    import tempfile
+
+    import torch
+    import wandb
+
+    art = wandb.Artifact(name=name, type="model", metadata={"vocab_size": vocab_size, **asdict(cfg)})
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = Path(tmp) / "model.pt"
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "vocab_size": vocab_size,
+                "config": asdict(cfg),
+            },
+            ckpt_path,
+        )
+        art.add_file(str(ckpt_path), name="model.pt")
+        wandb_run.log_artifact(art)
+
+
 def train_and_evaluate(
     tokenizer,
     train_corpus_path: Path,
@@ -605,6 +709,8 @@ def train_and_evaluate(
     language: str | None = None,
     eval_flores: bool = True,
     wandb_extra_config: dict | None = None,
+    tokenizer_artifact_dir: Path | None = None,
+    artifact_name: str | None = None,
 ) -> dict:
     """Train an LM with ``tokenizer`` then score it on test set + (optionally) FLORES.
 
@@ -614,10 +720,31 @@ def train_and_evaluate(
     Returns metrics with ``test_*`` and ``flores_*`` keys (the latter only if
     FLORES eval ran). If ``cfg.wandb_project`` is set, a W&B run is opened
     around the train+eval loop and final metrics are logged to its summary.
+    When ``tokenizer_artifact_dir`` is provided and ``cfg.wandb_log_*_artifact``
+    is on, the tokenizer dir is uploaded as a W&B artifact at the start of the
+    run and the trained model state_dict at the end.
     """
     wandb_run = _init_wandb(cfg, extra_config=wandb_extra_config)
     try:
-        model, device, amp_dtype, train_seconds = train_lm(
+        # Upload tokenizer artifact (small) up-front so it's available even
+        # if training crashes mid-way.
+        if (
+            wandb_run is not None
+            and cfg.wandb_log_tokenizer_artifact
+            and tokenizer_artifact_dir is not None
+            and Path(tokenizer_artifact_dir).is_dir()
+        ):
+            try:
+                _log_tokenizer_artifact(
+                    wandb_run,
+                    Path(tokenizer_artifact_dir),
+                    name=artifact_name or Path(tokenizer_artifact_dir).name,
+                )
+                log_fn("  uploaded tokenizer artifact to W&B")
+            except Exception as exc:
+                log_fn(f"  W&B tokenizer artifact upload failed (continuing): {exc}")
+
+        model, device, amp_dtype, train_seconds, train_corpus = train_lm(
             tokenizer, train_corpus_path, cfg, log_fn=log_fn, wandb_run=wandb_run,
         )
 
@@ -641,6 +768,13 @@ def train_and_evaluate(
                 for k, v in flores_metrics.items():
                     out[f"flores_{k}"] = v
 
+        # Training-corpus stats (rows + bytes/row, the sanity-check indicator).
+        out["train_tokens_actual"] = train_corpus.n_tokens
+        out["train_rows"] = train_corpus.rows
+        out["train_source_bytes"] = train_corpus.source_bytes
+        out["train_bytes_per_row"] = train_corpus.bytes_per_row
+        out["train_tokens_per_row"] = train_corpus.tokens_per_row
+
         out["param_count"] = count_parameters(model)
         out["train_seconds"] = train_seconds
         out["config"] = asdict(cfg)
@@ -649,6 +783,19 @@ def train_and_evaluate(
             for k, v in out.items():
                 if isinstance(v, (int, float)):
                     wandb_run.summary[k] = v
+
+        # Upload model checkpoint after eval so its metadata is final.
+        if wandb_run is not None and cfg.wandb_log_model_artifact:
+            try:
+                _log_model_artifact(
+                    wandb_run, model, cfg,
+                    vocab_size=tokenizer.vocab_size,
+                    name=artifact_name or "model",
+                )
+                log_fn("  uploaded model artifact to W&B")
+            except Exception as exc:
+                log_fn(f"  W&B model artifact upload failed (continuing): {exc}")
+
         return out
     finally:
         if wandb_run is not None:

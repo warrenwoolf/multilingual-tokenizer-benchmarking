@@ -14,7 +14,14 @@ Run after ``generate_tokenizers.py``. Requires the ``llm`` extras:
 
 Optional Weights & Biases logging: set ``WANDB_PROJECT`` below (or drop a key
 into ``tokens/wandb.token`` / set ``WANDB_API_KEY``). One W&B run per
-(language, algorithm, vocab_size) combo.
+(language, algorithm, vocab_size) combo. By default each run also uploads
+the tokenizer dir and the trained model state_dict as W&B Artifacts — turn
+``wandb_log_*_artifact`` off in ``LLM_CONFIG`` for large sweeps if storage
+is a concern (each model is ~200 MB at 50M params).
+
+The output CSV includes per-run row counts and a ``train_bytes_per_row``
+column — sanity-check it against your expected per-language byte size to
+make sure the data slice is what you think it is.
 
 Edit the constants below to change the run.
 """

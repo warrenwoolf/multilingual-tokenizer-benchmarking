@@ -57,15 +57,27 @@ def trained_bpe(tiny_corpus, tmp_path_factory):
 
 
 def test_tokenize_corpus_respects_max_tokens(tiny_corpus, trained_bpe):
-    arr = tokenize_corpus(trained_bpe, tiny_corpus, max_tokens=1000)
-    assert arr.dtype.name == "int32"
-    assert 0 < arr.shape[0] <= 1000
+    corpus = tokenize_corpus(trained_bpe, tiny_corpus, max_tokens=1000)
+    assert corpus.ids.dtype.name == "int32"
+    assert 0 < corpus.n_tokens <= 1000
+    assert corpus.rows > 0
+    assert corpus.source_bytes > 0
 
 
 def test_tokenize_corpus_full_pass(tiny_corpus, trained_bpe):
-    arr = tokenize_corpus(trained_bpe, tiny_corpus, max_tokens=None)
+    corpus = tokenize_corpus(trained_bpe, tiny_corpus, max_tokens=None)
     # Tiny corpus is ~26 lines × 200 repeats; should yield way more than ctx_len.
-    assert arr.shape[0] > TINY_CONFIG.ctx_len * 10
+    assert corpus.n_tokens > TINY_CONFIG.ctx_len * 10
+    assert corpus.rows > 100  # 26 lines * 200 repeats = 5200 — plenty of margin
+
+
+def test_tokenize_corpus_bytes_per_row_is_sane(tiny_corpus, trained_bpe):
+    """Bytes-per-row indicator must be positive and roughly the line length."""
+    corpus = tokenize_corpus(trained_bpe, tiny_corpus, max_tokens=None)
+    # The fixture mixes en/ru/hi/tr, ~50-100 chars/line; UTF-8 bumps non-Latin
+    # rows. A range of 30-300 covers anything sane while catching off-by-orders.
+    assert 30 < corpus.bytes_per_row < 300
+    assert corpus.tokens_per_row > 0
 
 
 def test_train_lm_runs_and_reduces_loss(tiny_corpus, trained_bpe, capsys):
@@ -80,7 +92,7 @@ def test_train_lm_runs_and_reduces_loss(tiny_corpus, trained_bpe, capsys):
             except (IndexError, ValueError):
                 pass
 
-    model, device, amp_dtype, train_seconds = train_lm(
+    model, device, amp_dtype, train_seconds, train_corpus = train_lm(
         trained_bpe, tiny_corpus, TINY_CONFIG, log_fn=capture
     )
     assert train_seconds >= 0
@@ -89,6 +101,9 @@ def test_train_lm_runs_and_reduces_loss(tiny_corpus, trained_bpe, capsys):
     # Sanity: parameter count is in the right ballpark for the tiny config.
     n = count_parameters(model)
     assert 10_000 < n < 5_000_000
+    # train_corpus stats are surfaced for the bytes-per-row indicator.
+    assert train_corpus.rows > 0
+    assert train_corpus.bytes_per_row > 0
 
 
 def test_train_and_evaluate_returns_finite_metrics(tiny_corpus, trained_bpe):
@@ -107,6 +122,11 @@ def test_train_and_evaluate_returns_finite_metrics(tiny_corpus, trained_bpe):
     assert metrics["test_bits_per_byte"] > 0
     assert metrics["param_count"] > 0
     assert metrics["test_eval_tokens_scored"] > 0
+    # New row-based stats should be present and consistent.
+    assert metrics["train_rows"] > 0
+    assert metrics["train_bytes_per_row"] > 0
+    assert metrics["test_eval_rows_scored"] > 0
+    assert metrics["test_eval_bytes_per_row"] > 0
     # FLORES eval was disabled, so flores_* keys must not be present.
     assert not any(k.startswith("flores_") for k in metrics)
 
@@ -143,7 +163,7 @@ def test_wandb_disabled_when_project_unset(tiny_corpus, trained_bpe):
 
 def test_perplexity_matches_exp_of_mean_nll(tiny_corpus, trained_bpe):
     """exp(mean_nll_per_token) must equal perplexity (sanity check for BPB)."""
-    model, device, amp_dtype, _ = train_lm(
+    model, device, amp_dtype, _, _ = train_lm(
         trained_bpe, tiny_corpus, TINY_CONFIG, log_fn=lambda *a, **k: None
     )
     metrics = evaluate_perplexity(

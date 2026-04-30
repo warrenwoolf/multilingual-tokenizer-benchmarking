@@ -121,6 +121,19 @@ final eval metrics to Weights & Biases. Set `WANDB_PROJECT` (env var or in
 `tokens/wandb.token` (gitignored). In Colab, `colab.py` reads the
 `WANDB_API_KEY` Colab Secret and writes it to the token slot for you.
 
+**W&B Artifacts.** Each run also uploads:
+- the tokenizer artifact dir (type=`tokenizer`, ~MB) at run start
+- the trained model state_dict (type=`model`, ~200 MB at 50M params) at end
+Toggle via `wandb_log_tokenizer_artifact` / `wandb_log_model_artifact` on
+`LLMConfig`. Pull a previously-trained model with
+`wandb.use_artifact("model:vN").download()`.
+
+**Row-based data accounting.** The data pipeline budgets in document rows,
+not bytes. `llm_results.csv` records `train_rows`, `train_bytes_per_row`,
+`train_tokens_per_row`, and the matching `*_eval_*` columns — eyeball
+`bytes_per_row` to confirm the per-language slice matches expectations
+(non-Latin scripts produce ~3× the byte count per character).
+
 ## Quick start
 
 ### Local
