@@ -36,23 +36,20 @@ def fertility(tokenizer, sentences: list[str]) -> float:
 
 
 def vocabulary_coverage(tokenizer, sentences: list[str]) -> float:
-    """Fraction of word types in sentences that are in the tokenizer vocab as a single token.
+    """Fraction of word types in sentences representable without UNK.
 
-    Byte-level vocabularies (tiktoken, ByT5) store tokens in their byte-level
-    encoding (e.g. ``Ġhello`` rather than ``hello``), so a raw word-string
-    lookup against ``get_vocab()`` reports near-zero coverage. For those
-    tokenizers we fall back to checking whether the word encodes to a single
-    id, which is the property the metric is trying to capture in the first
-    place.
+    Byte-level tokenizers (ByT5, tiktoken) can encode every possible byte
+    sequence, so their coverage is always 1.0. For subword tokenizers we
+    check whether each word type appears as a single token in the vocab,
+    which is the standard proxy for coverage used in the literature.
     """
     word_types = {w for s in sentences for w in s.split()}
     if not word_types:
         return 1.0
     if getattr(tokenizer, "is_byte_level", False):
-        covered = sum(1 for w in word_types if len(tokenizer.encode(w)) == 1)
-    else:
-        vocab = set(getattr(tokenizer, "get_vocab", lambda: {})())
-        covered = sum(1 for w in word_types if w in vocab)
+        return 1.0
+    vocab = set(getattr(tokenizer, "get_vocab", lambda: {})())
+    covered = sum(1 for w in word_types if w in vocab)
     return covered / len(word_types)
 
 

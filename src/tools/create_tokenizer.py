@@ -9,9 +9,12 @@ from pathlib import Path
 from src.utils.morpheme_segmentation import SUPPORTED_LANGUAGES as MORPHBPE_LANGUAGES
 from src.utils.tokenizer_algorithms import SUPPORTED_ALGORITHMS, train_tokenizer
 
-# ByT5 has a fixed ~259-id vocab (training is a no-op), so we only emit one
+# ByT5 has a fixed 256-byte vocab (training is a no-op), so we only emit one
 # artifact per language regardless of the requested vocab sweep.
 SINGLE_SIZE_ALGORITHMS = {"byt5"}
+# Actual vocab sizes for fixed-size algorithms (used in artifact naming so the
+# CSV correctly shows 256 rather than 0).
+_FIXED_VOCAB_SIZES: dict[str, int] = {"byt5": 256}
 
 # Per-algorithm language allow-lists. Anything not listed here is treated
 # as language-agnostic. MorphBPE needs a per-language morpheme segmenter,
@@ -63,12 +66,12 @@ def iter_jobs(
 ):
     """Yield (language, algorithm, vocab_size) triples to train.
 
-    Algorithms in SINGLE_SIZE_ALGORITHMS get a single vocab_size of 0 since
-    their vocab is fixed.
+    Algorithms in SINGLE_SIZE_ALGORITHMS get their actual fixed vocab size
+    instead of the sweep values, so artifact names reflect the real vocab.
     """
     for lang in languages:
         for algo in algorithms:
-            sizes = [0] if algo in SINGLE_SIZE_ALGORITHMS else vocab_sizes
+            sizes = [_FIXED_VOCAB_SIZES[algo]] if algo in SINGLE_SIZE_ALGORITHMS else vocab_sizes
             for vs in sizes:
                 yield lang, algo, vs
 
