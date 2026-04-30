@@ -13,9 +13,10 @@ custom trainer.
 Per-language morpheme segmenters
 --------------------------------
 - en (English):  Morfessor 2.0 trained unsupervisedly on the corpus.
-- tr (Turkish):  Morfessor 2.0 trained unsupervisedly on the corpus.
+- hu (Hungarian):Morfessor 2.0 trained unsupervisedly on the corpus.
                  (Morfessor was originally designed for Finnish, another
-                 agglutinative language; it works well for Turkish too.)
+                 Uralic agglutinative language; it works well for Hungarian
+                 given its similarly rich suffixal morphology.)
 - zh (Mandarin): not supported. Mandarin is super-analytic — its words
                  don't decompose into the inflectional/derivational
                  morphemes MorphBPE was designed to exploit — so we raise
@@ -32,11 +33,11 @@ import warnings
 from collections import Counter
 from pathlib import Path
 
-SUPPORTED_LANGUAGES: tuple[str, ...] = ("en", "tr")
+SUPPORTED_LANGUAGES: tuple[str, ...] = ("en", "hu")
 
 # Cap how many word types we feed to Morfessor. Morfessor's MDL objective
 # scales with vocabulary, and on a 500MB corpus the type count is ~1-3M;
-# 200k covers >99% of token mass for both English and Turkish.
+# 200k covers >99% of token mass for both English and Hungarian.
 DEFAULT_MAX_TYPES = 200_000
 
 # Cap on lines read for word-frequency collection. None = read whole file.
@@ -152,7 +153,7 @@ def segment_corpus(
             f"Morfessor produced no morpheme splits for language {language!r} "
             f"({n_total} word tokens checked). MorphBPE will be equivalent to "
             f"plain BPE for this corpus. Morfessor works best on agglutinative "
-            f"languages (Turkish, Finnish) with large, morphologically diverse "
+            f"languages (Hungarian, Finnish) with large, morphologically diverse "
             f"corpora. For English the paper (Asgari et al. 2025) uses gold "
             f"SIGMORPHON segmentations rather than Morfessor.",
             stacklevel=2,

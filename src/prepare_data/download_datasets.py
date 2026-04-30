@@ -4,7 +4,7 @@ Target languages
 -----------------
 en  – English   (analytic)        -- HuggingFaceFW/fineweb (sample-10BT)
 zh  – Mandarin  (super-analytic)  -- HuggingFaceFW/fineweb-2 (cmn_Hani)
-tr  – Turkish   (agglutinative)   -- HuggingFaceFW/fineweb-2 (tur_Latn)
+hu  – Hungarian (agglutinative)   -- HuggingFaceFW/fineweb-2 (hun_Latn)
 
 Russian and Hindi remain configured for ad-hoc use:
 ru  – Russian   (fusional)        -- HuggingFaceFW/fineweb-2 (rus_Cyrl)
@@ -22,7 +22,7 @@ from tqdm import tqdm
 LANGUAGE_CONFIGS: dict[str, dict] = {
     "en": {"repo": "HuggingFaceFW/fineweb", "config": "sample-10BT"},
     "zh": {"repo": "HuggingFaceFW/fineweb-2", "config": "cmn_Hani"},
-    "tr": {"repo": "HuggingFaceFW/fineweb-2", "config": "tur_Latn"},
+    "hu": {"repo": "HuggingFaceFW/fineweb-2", "config": "hun_Latn"},
     "ru": {"repo": "HuggingFaceFW/fineweb-2", "config": "rus_Cyrl"},
     "hi": {"repo": "HuggingFaceFW/fineweb-2", "config": "hin_Deva"},
 }
@@ -55,7 +55,7 @@ def download_language(
     """Stream one language from HF and write train.txt + eval.txt.
 
     Args:
-        language: Code in LANGUAGE_CONFIGS (en/zh/tr/ru/hi).
+        language: Code in LANGUAGE_CONFIGS (en/zh/hu/ru/hi).
         output_dir: Directory; we create ``{output_dir}/{language}/``.
         train_budget_mb: Ignored (kept for backwards compatibility).
         eval_budget_mb: Ignored (kept for backwards compatibility).

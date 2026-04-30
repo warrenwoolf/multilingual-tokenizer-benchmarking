@@ -42,7 +42,7 @@ repo was an empty placeholder at the time of writing, so this is a from-
 scratch implementation rather than a wrapper. Per-language segmenters
 (`src/utils/morpheme_segmentation.py`):
 
-- **English & Turkish:** unsupervised Morfessor 2.0 trained on the corpus.
+- **English & Hungarian:** unsupervised Morfessor 2.0 trained on the corpus.
 - **Mandarin:** not supported — Mandarin is super-analytic and lacks the
   inflectional morphology MorphBPE was designed to exploit. The (zh,
   morphbpe) sweep cell is auto-skipped by ``generate_tokenizers``.
@@ -53,7 +53,7 @@ scratch implementation rather than a wrapper. Per-language segmenters
 |------|----------|------------------|--------|
 | en   | English  | Analytic         | `HuggingFaceFW/fineweb` (sample-10BT) |
 | zh   | Mandarin | Super-analytic   | `HuggingFaceFW/fineweb-2` (`cmn_Hani`) |
-| tr   | Turkish  | Agglutinative    | `HuggingFaceFW/fineweb-2` (`tur_Latn`) |
+| hu   | Hungarian| Agglutinative    | `HuggingFaceFW/fineweb-2` (`hun_Latn`) |
 
 Russian (`ru` / `rus_Cyrl`) and Hindi (`hi` / `hin_Deva`) are kept configured
 in `LANGUAGE_CONFIGS` for ad-hoc use; they're just not in the default

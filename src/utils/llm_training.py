@@ -72,7 +72,7 @@ from typing import Iterator
 FLORES_CONFIGS: dict[str, str] = {
     "en": "eng_Latn",
     "zh": "zho_Hans",
-    "tr": "tur_Latn",
+    "hu": "hun_Latn",
     "ru": "rus_Cyrl",
     "hi": "hin_Deva",
 }

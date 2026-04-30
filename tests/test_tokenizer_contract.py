@@ -317,7 +317,7 @@ def test_morphbpe_multiword_decode_drops_spaces(morphbpe_tokenizer):
 # and morphological patterns repeat across many word types — typical of
 # agglutinative languages.  We generate a synthetic Finnish-style corpus
 # (regular root+suffix paradigms) that reliably triggers segmentation.
-# The supported language nearest to Finnish in the codebase is Turkish ("tr"),
+# The supported language nearest to Finnish in the codebase is Hungarian ("hu"),
 # which shares the same agglutinative typology.
 
 
@@ -442,7 +442,7 @@ def test_morphbpe_no_cross_morpheme_tokens(agglutinative_corpus, tmp_path_factor
         algorithm="morphbpe",
         vocab_size=500,
         output_dir=out,
-        language="tr",
+        language="hu",
     )
     tok = load_tokenizer(out, algorithm="morphbpe")
 
