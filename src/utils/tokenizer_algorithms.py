@@ -188,12 +188,17 @@ def train_tokenizer(
     vocab_size: int,
     output_dir: Path,
     language: str | None = None,
+    morphynet_cache_dir: Path | None = None,
 ) -> None:
     """Train a tokenizer and persist it to output_dir.
 
     ``language`` is required for algorithms that need a per-language asset
     (currently only MorphBPE, which needs a morpheme segmenter); other
     algorithms ignore it.
+
+    ``morphynet_cache_dir`` controls where MorphyNet data is cached for
+    English MorphBPE. Defaults to ``~/.cache/morphynet``; pass a tmp
+    directory in tests to avoid network access.
     """
     if algorithm not in SUPPORTED_ALGORITHMS:
         raise ValueError(f"Unknown algorithm {algorithm!r}. Choose from {SUPPORTED_ALGORITHMS}")
@@ -205,7 +210,7 @@ def train_tokenizer(
                 "MorphBPE training requires a `language` argument so the "
                 "right morpheme segmenter can be selected."
             )
-        _train_morphbpe(Path(corpus_path), vocab_size, output_dir, language)
+        _train_morphbpe(Path(corpus_path), vocab_size, output_dir, language, morphynet_cache_dir=morphynet_cache_dir)
         return
     dispatch = {
         "bpe": _train_bpe,
@@ -300,7 +305,11 @@ def _train_tiktoken(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
 
 
 def _train_morphbpe(
-    corpus_path: Path, vocab_size: int, output_dir: Path, language: str
+    corpus_path: Path,
+    vocab_size: int,
+    output_dir: Path,
+    language: str,
+    morphynet_cache_dir: Path | None = None,
 ) -> None:
     """MorphBPE (Asgari et al. 2025).
 
@@ -332,7 +341,10 @@ def _train_morphbpe(
     inference-time tokenization incorrect (the </w> marker appears at
     morpheme ends in training but not in raw words at inference).
 
-    See src/utils/morpheme_segmentation.py for the per-language segmenter.
+    Per-language segmenters (src/utils/morpheme_segmentation.py):
+      en — MorphyNet gold inflectional lookup (~650k entries, downloaded once).
+      hu — Morfessor 2.0 trained unsupervisedly on the corpus.
+
     The official llm-lab-org/MorphBPE repo was an empty placeholder at the
     time of writing, so this is a from-scratch implementation of the
     paper's algorithm rather than a wrapper around official code.
@@ -345,7 +357,7 @@ def _train_morphbpe(
 
     with tempfile.TemporaryDirectory(prefix="morphbpe_") as td:
         segmented = Path(td) / "segmented.txt"
-        segment_corpus(corpus_path, segmented, language=language)
+        segment_corpus(corpus_path, segmented, language=language, morphynet_cache_dir=morphynet_cache_dir)
 
         tok = Tokenizer(BPE(unk_token="<unk>"))
         tok.pre_tokenizer = Whitespace()

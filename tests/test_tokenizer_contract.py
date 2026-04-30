@@ -201,7 +201,57 @@ def english_corpus(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def morphbpe_tokenizer(english_corpus, tmp_path_factory):
+def morphynet_cache_dir(tmp_path_factory) -> Path:
+    """Minimal MorphyNet-format TSV covering words in ENGLISH_SENTENCES.
+
+    Written to a tmp dir so tests never hit the network. Format mirrors
+    eng.inflectional.v1.tsv: lemma TAB inflected TAB features TAB morphemes.
+    """
+    cache = tmp_path_factory.mktemp("morphynet")
+    rows = [
+        "run\trunning\tV|V.PTCP;PRS\trun|n|ing",
+        "run\trunner\tN\trun|n|er",
+        "run\trunners\tN|PL\trun|n|er|s",
+        "run\truns\tV|PRS;3;SG\trun|s",
+        "happy\thappiness\tN\thappi|ness",
+        "happy\thappily\tR\thappi|ly",
+        "happy\thappier\tJ\thappi|er",
+        "happy\tunhappiness\tN\tun|happi|ness",
+        "sad\tsadness\tN\tsad|ness",
+        "token\ttokenization\tN\ttoken|iz|ation",
+        "token\ttokenizer\tN\ttoken|iz|er",
+        "token\ttokenizers\tN|PL\ttoken|iz|er|s",
+        "token\ttokenized\tV|PST\ttoken|iz|ed",
+        "token\ttokenizes\tV|PRS;3;SG\ttoken|iz|es",
+        "tokenize\ttokenize\tV\ttoken|ize",
+        "process\tpreprocessing\tV|V.PTCP;PRS\tpre|process|ing",
+        "process\tpostprocessing\tV|V.PTCP;PRS\tpost|process|ing",
+        "process\treprocessing\tV|V.PTCP;PRS\tre|process|ing",
+        "process\tprocessing\tV|V.PTCP;PRS\tprocess|ing",
+        "comfort\tdiscomfort\tN\tdis|comfort",
+        "comfort\tcomfortable\tJ\tcomfort|able",
+        "comfort\tuncomfortable\tJ\tun|comfort|able",
+        "bear\tunbearable\tJ\tun|bear|able",
+        "whelm\toverwhelming\tV|V.PTCP;PRS\tover|whelm|ing",
+        "quick\tquickly\tR\tquick|ly",
+        "sell\tsells\tV|PRS;3;SG\tsell|s",
+        "learn\tlearning\tV|V.PTCP;PRS\tlearn|ing",
+        "train\ttraining\tV|V.PTCP;PRS\ttrain|ing",
+        "represent\trepresentations\tN|PL\tre|present|ation|s",
+        "require\trequires\tV|PRS;3;SG\trequire|s",
+        "compare\tcompares\tV|PRS;3;SG\tcompare|s",
+        "reveal\treveals\tV|PRS;3;SG\treveal|s",
+        "control\tcontrols\tV|PRS;3;SG\tcontrol|s",
+        "split\tsplits\tV|PRS;3;SG\tsplit|s",
+        "jump\tjumps\tV|PRS;3;SG\tjump|s",
+    ]
+    tsv = cache / "eng.inflectional.v1.tsv"
+    tsv.write_text("\n".join(rows), encoding="utf-8")
+    return cache
+
+
+@pytest.fixture(scope="module")
+def morphbpe_tokenizer(english_corpus, morphynet_cache_dir, tmp_path_factory):
     out = tmp_path_factory.mktemp("artifact_morphbpe")
     train_tokenizer(
         corpus_path=english_corpus,
@@ -209,6 +259,7 @@ def morphbpe_tokenizer(english_corpus, tmp_path_factory):
         vocab_size=VOCAB_SIZE,
         output_dir=out,
         language="en",
+        morphynet_cache_dir=morphynet_cache_dir,
     )
     return load_tokenizer(out, algorithm="morphbpe")
 
@@ -448,11 +499,12 @@ def test_morphbpe_no_cross_morpheme_tokens(agglutinative_corpus, tmp_path_factor
 
     counts = _collect_word_counts(agglutinative_corpus)
     morph_model = _train_morfessor(counts, max_types=200_000)
+    segmenter_fn = lambda w: list(morph_model.viterbi_segment(w)[0])
     cache: dict = {}
 
     cross_boundary_tokens: list[str] = []
     for word in counts:
-        morphemes = _segment_word(morph_model, word, cache)
+        morphemes = _segment_word(segmenter_fn, word, cache)
         if len(morphemes) <= 1:
             continue  # unsplit word — no boundary to check
         ids = tok.encode(word)
