@@ -29,7 +29,6 @@ LANGUAGE_CONFIGS: dict[str, dict] = {
 
 DEFAULT_MAX_TRAIN_ROWS = 500_000
 DEFAULT_MAX_EVAL_ROWS = 25_000
-BATCH_SIZE = 1_000_000
 
 
 def _load_token() -> str | None:
@@ -91,8 +90,6 @@ def download_language(
             token=token,
         )
 
-    train_buffer: list[str] = []
-    eval_buffer: list[str] = []
     train_count = 0
     eval_count = 0
 
@@ -108,26 +105,13 @@ def download_language(
             line = text.replace("\n", " ")
 
             if train_count < max_train_rows:
-                train_buffer.append(line)
+                train_fh.write(line + "\n")
                 train_count += 1
-                if len(train_buffer) % BATCH_SIZE == 0:
-                    train_fh.write("\n".join(train_buffer) + "\n")
-                    print(f"  [{language}] train: {train_count} rows so far...")
-                    train_buffer.clear()
             elif eval_count < max_eval_rows:
-                eval_buffer.append(line)
+                eval_fh.write(line + "\n")
                 eval_count += 1
-                if len(eval_buffer) % BATCH_SIZE == 0:
-                    eval_fh.write("\n".join(eval_buffer) + "\n")
-                    print(f"  [{language}] eval: {eval_count} rows so far...")
-                    eval_buffer.clear()
             else:
                 break
-
-        if train_buffer:
-            train_fh.write("\n".join(train_buffer) + "\n")
-        if eval_buffer:
-            eval_fh.write("\n".join(eval_buffer) + "\n")
 
     print(f"  [{language}] done — train: {train_count} rows, eval: {eval_count} rows")
     print(f"  train -> {train_path}")
