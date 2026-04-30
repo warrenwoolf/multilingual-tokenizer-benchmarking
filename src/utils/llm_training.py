@@ -648,8 +648,9 @@ def evaluate_perplexity_on_sentences(
 def load_flores_devtest(language: str) -> list[str]:
     """Return FLORES-200 devtest sentences for ``language`` (en/zh/tr/ru/hi).
 
-    Uses the canonical ``facebook/flores`` dataset on the Hub. Network call;
-    cached by the ``datasets`` library after the first hit.
+    Tries ``facebook/flores`` first, then ``facebook/flores-200`` as a fallback
+    in case the dataset has been renamed or restructured on the Hub. Network
+    call; cached by the ``datasets`` library after the first hit.
     """
     if language not in FLORES_CONFIGS:
         raise ValueError(
@@ -659,9 +660,27 @@ def load_flores_devtest(language: str) -> list[str]:
     config = FLORES_CONFIGS[language]
     from datasets import load_dataset
 
-    ds = load_dataset("facebook/flores", config, split="devtest")
-    # FLORES rows have a 'sentence' field (canonical translation in `config`).
-    return [row["sentence"] for row in ds]
+    last_exc: Exception | None = None
+    for repo_id in ("facebook/flores", "facebook/flores-200"):
+        try:
+            ds = load_dataset(repo_id, config, split="devtest", trust_remote_code=False)
+            # Prefer the bare 'sentence' column; fall back to 'sentence_<config>'
+            # in case the dataset uses the all-languages column naming scheme.
+            col = "sentence" if "sentence" in ds.column_names else f"sentence_{config}"
+            if col not in ds.column_names:
+                raise KeyError(
+                    f"Neither 'sentence' nor 'sentence_{config}' found in "
+                    f"{repo_id!r} columns: {ds.column_names}"
+                )
+            return [row[col] for row in ds]
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    raise RuntimeError(
+        f"Could not load FLORES devtest for {language!r} (config={config!r}) "
+        f"from any known repo. Last error: {last_exc}"
+    ) from last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -758,15 +777,16 @@ def train_and_evaluate(
         if eval_flores and language is not None:
             try:
                 flores_sents = load_flores_devtest(language)
-            except Exception as exc:
-                log_fn(f"  FLORES eval skipped: {exc}")
-            else:
                 flores_metrics = evaluate_perplexity_on_sentences(
                     model, tokenizer, flores_sents, cfg, device, amp_dtype,
                     label=f"flores/{FLORES_CONFIGS[language]}", log_fn=log_fn,
                 )
                 for k, v in flores_metrics.items():
                     out[f"flores_{k}"] = v
+            except Exception as exc:
+                import traceback as _tb
+                log_fn(f"  FLORES eval skipped for {language!r}: {exc}")
+                log_fn(_tb.format_exc())
 
         # Training-corpus stats (rows + bytes/row, the sanity-check indicator).
         out["train_tokens_actual"] = train_corpus.n_tokens
