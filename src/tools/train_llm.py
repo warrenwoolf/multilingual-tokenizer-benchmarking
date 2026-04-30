@@ -158,6 +158,7 @@ def train_all_llms(
     only_algorithms: list[str] | None = None,
     only_vocab_sizes: list[int] | None = None,
     eval_flores: bool = True,
+    skip_runs: list[str] | None = None,
 ) -> Path:
     """Iterate every artifact, train a small LM, and write results to CSV.
 
@@ -189,6 +190,9 @@ def train_all_llms(
         if only_algorithms and algo not in only_algorithms:
             continue
         if only_vocab_sizes and vs not in only_vocab_sizes:
+            continue
+        if skip_runs and artifact.name in skip_runs:
+            print(f"[skip] {artifact.name} listed in skip_runs")
             continue
         artifacts.append((artifact, lang, algo, vs))
 

@@ -14,6 +14,7 @@
 #
 # Tweak via the SETTINGS block. Defaults are conservative for free-tier Colab
 # (small budget so a full run finishes in roughly 10 minutes).
+# Use SKIP_TOKENIZER_EVAL and SKIP_LLM_RUNS to resume partial runs.
 # ---------------------------------------------------------------------------
 
 # === SETTINGS ==============================================================
@@ -43,6 +44,14 @@ UPLOAD_TOKENIZER_ARTIFACTS = False
 DOWNLOAD_TOKENIZER_ARTIFACTS = False
 TOKENIZER_WANDB_PROJECT = "tokenizer-bench"   # project used for artifact storage
 TOKENIZER_WANDB_ENTITY = None                 # set to your W&B username/team, or None for default
+
+# Skip options — useful when reusing previously generated artifacts.
+# Set SKIP_TOKENIZER_EVAL = True when tokenizer artifacts were downloaded from
+#   W&B and you want to jump straight to LLM training without re-running evals.
+SKIP_TOKENIZER_EVAL = False
+# List artifact names to exclude from LLM training, e.g. runs you already
+#   completed in a previous session: ["en_bpe_v8000", "zh_bpe_v8000"]
+SKIP_LLM_RUNS: list = []
 # ===========================================================================
 
 import os
@@ -207,13 +216,16 @@ else:
         )
 
 # --- evaluate (intrinsic metrics) ---
-from src.tools.evaluate_tokenizer import evaluate_all_tokenizers
-evaluate_all_tokenizers(
-    data_dir='data',
-    artifact_dir='artifacts',
-    results_path='results.csv',
-    continue_on_error=True,
-)
+if not {SKIP_TOKENIZER_EVAL}:
+    from src.tools.evaluate_tokenizer import evaluate_all_tokenizers
+    evaluate_all_tokenizers(
+        data_dir='data',
+        artifact_dir='artifacts',
+        results_path='results.csv',
+        continue_on_error=True,
+    )
+else:
+    print("[colab] Skipping tokenizer eval (SKIP_TOKENIZER_EVAL=True)")
 
 # --- evaluate (downstream LLM PPL/BPB) ---
 if {RUN_LLM_EVAL}:
@@ -230,6 +242,7 @@ if {RUN_LLM_EVAL}:
         config=cfg,
         continue_on_error=True,
         eval_flores=True,
+        skip_runs={SKIP_LLM_RUNS!r} or None,
     )
 """
 with open("/tmp/run_pipeline.py", "w") as fh:
@@ -238,8 +251,12 @@ with open("/tmp/run_pipeline.py", "w") as fh:
 
 # 5. Display results
 import pandas as pd
-df = pd.read_csv("results.csv")
-print(df.to_string(index=False))
+if os.path.exists("results.csv"):
+    df = pd.read_csv("results.csv")
+    print(df.to_string(index=False))
+else:
+    df = None
+    print("[colab] results.csv not found — tokenizer eval was skipped.")
 
 # Also display LLM results if the downstream eval ran. Look at
 # `train_bytes_per_row` to sanity-check the per-language data slice.
@@ -248,4 +265,4 @@ if RUN_LLM_EVAL and os.path.exists("llm_results.csv"):
     llm_df = pd.read_csv("llm_results.csv")
     print(llm_df.to_string(index=False))
 
-df  # last expression renders as a Colab table
+df  # last expression renders as a Colab table (None if eval was skipped)
