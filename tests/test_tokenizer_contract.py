@@ -1,8 +1,9 @@
 """Contract tests that every tokenizer adapter must satisfy.
 
-Parametrized across all trainable algorithms. SuperBPE is covered in a
-separate test module because its training requires cloning an external
-repo and a Rust toolchain.
+Parametrized across all trainable algorithms. MorphBPE is per-language
+(it needs a morpheme segmenter), so the multilingual fixture corpus
+doesn't fit; it gets its own English-only contract block at the bottom.
+SuperBPE has additional invariant tests in tests/test_superbpe.py.
 """
 
 from __future__ import annotations
@@ -19,11 +20,9 @@ from src.utils.tokenizer_algorithms import (
 )
 from tests.conftest import SAMPLE_STRINGS
 
-# SuperBPE needs an external repo + Rust toolchain to train, so it stays
-# out of the parametrized contract. MorphBPE is per-language (it needs a
-# morpheme segmenter), so the multilingual fixture corpus doesn't fit; it
-# gets its own English-only contract block at the bottom of the file.
-SKIP_IN_CONTRACT = {"superbpe", "morphbpe"}
+# MorphBPE is per-language (needs a morpheme segmenter), so the multilingual
+# fixture corpus doesn't fit; it gets its own English-only block below.
+SKIP_IN_CONTRACT = {"morphbpe"}
 CONTRACT_ALGORITHMS = [a for a in SUPPORTED_ALGORITHMS if a not in SKIP_IN_CONTRACT]
 
 VOCAB_SIZE = 1000

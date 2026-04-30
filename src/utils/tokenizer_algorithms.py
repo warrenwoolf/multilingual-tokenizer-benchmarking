@@ -365,22 +365,115 @@ _SUPERBPE_STAGE2_REGEX = (
 )
 
 
+def _superbpe_extend_stage2(
+    tok1,
+    corpus_path: Path,
+    s1_vocab: dict,
+    s1_merges: list,
+    stage2_budget: int,
+    max_lines: int = 20_000,
+) -> tuple[dict, list]:
+    """Extend stage-1 BPE with cross-word merges via token-level BPE extension.
+
+    BpeTrainer ignores pre-loaded merges and retrains from scratch, so we
+    implement stage-2 extension manually:
+    1. Encode the corpus using stage-1 BPE with the stage-2 (permissive)
+       pre-tokenizer already set on tok1.  Each document segment is now a
+       sequence of stage-1 tokens that can span what used to be word
+       boundaries.
+    2. Run iterative BPE on those token-string sequences, counting adjacent
+       pair frequencies and merging the most frequent pair each step.
+    3. Return the updated vocab and the new stage-2 merges.
+
+    The resulting merge list is [s1_merges] + [new_merges], preserving the
+    hierarchical structure: word-boundary merges come first.
+    """
+    from collections import defaultdict
+
+    sequences: list[list[str]] = []
+    with open(corpus_path, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if i >= max_lines:
+                break
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                enc = tok1.encode(line)
+                tokens = list(enc.tokens)
+            except Exception:
+                continue
+            if len(tokens) >= 2:
+                sequences.append(tokens)
+
+    if not sequences:
+        return dict(s1_vocab), []
+
+    # Count all adjacent pair frequencies across the corpus.
+    pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for seq in sequences:
+        for j in range(len(seq) - 1):
+            pair_counts[(seq[j], seq[j + 1])] += 1
+
+    vocab = dict(s1_vocab)
+    next_id = max(vocab.values()) + 1 if vocab else 256
+    new_merges: list[tuple[str, str]] = []
+
+    for _ in range(stage2_budget):
+        if not pair_counts:
+            break
+        best_pair = max(pair_counts, key=pair_counts.__getitem__)
+        if pair_counts[best_pair] < 2:
+            break
+        a, b = best_pair
+        merged = a + b
+        if merged not in vocab:
+            vocab[merged] = next_id
+            next_id += 1
+        new_merges.append(best_pair)
+        del pair_counts[best_pair]
+
+        # Incremental update: scan sequences, merge occurrences, adjust counts
+        # for context pairs that are created or destroyed by each merge.
+        for seq in sequences:
+            i = 0
+            while i < len(seq) - 1:
+                if seq[i] == a and seq[i + 1] == b:
+                    if i > 0:
+                        gone = (seq[i - 1], a)
+                        pair_counts[gone] -= 1
+                        if pair_counts[gone] <= 0:
+                            del pair_counts[gone]
+                        pair_counts[(seq[i - 1], merged)] += 1
+                    if i + 2 < len(seq):
+                        gone = (b, seq[i + 2])
+                        pair_counts[gone] -= 1
+                        if pair_counts[gone] <= 0:
+                            del pair_counts[gone]
+                        pair_counts[(merged, seq[i + 2])] += 1
+                    seq[i] = merged
+                    del seq[i + 1]
+                    # Stay at i: the new token may form a new pair with the next.
+                else:
+                    i += 1
+
+    return vocab, new_merges
+
+
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
-    """Byte-level two-stage SuperBPE (Nut et al. 2025), matching the original
-    PythonNut/superbpe architecture.
+    """Byte-level two-stage SuperBPE (Nut et al. 2025).
 
-    Both stages use Sequence([Split(regex), ByteLevel()]) as the pre-tokenizer —
-    the same byte-level BPE architecture as tiktoken/GPT-2.  The difference is
-    in the regex:
+    Both stages use Sequence([Split(regex), ByteLevel()]) — the same
+    byte-level BPE architecture as tiktoken/GPT-2.
 
-    Stage 1 — GPT-2-style regex splits on word boundaries; trains 90 % of the
-              vocab budget.
-    Stage 2 — permissive regex skips splits before letters/digits, so the BPE
-              trainer sees " hello world" as one unit and can learn cross-word
-              merges for the remaining 10 % of the vocab budget.
+    Stage 1 — GPT-2-style word-boundary regex; trains 90 % of the vocab.
+    Stage 2 — permissive regex that does NOT split on spaces before
+               letters/digits; extends stage-1 merges with cross-word
+               tokens for the remaining 10 %, using token-level BPE
+               extension (not BpeTrainer, which ignores pre-loaded merges).
 
-    Stage 2 is seeded with stage-1 vocab + merges so it extends rather than
-    retrains from scratch.
+    Final tokenizer: BPE(merges=[stage-1 merges] + [stage-2 merges]) with
+    the stage-2 permissive pre-tokenizer so encoding uses cross-word context.
     """
     import json as _json
     from tokenizers import Regex, Tokenizer
@@ -397,8 +490,9 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
         ])
 
     stage1_size = int(vocab_size * 0.9)
+    stage2_budget = vocab_size - stage1_size
 
-    # Stage 1: word-boundary byte-level BPE.
+    # --- Stage 1: word-boundary byte-level BPE ---
     tok1 = Tokenizer(BPE())
     tok1.pre_tokenizer = _pretok(_SUPERBPE_STAGE1_REGEX)
     tok1.decoder = _decoders.ByteLevel()
@@ -409,19 +503,33 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
     s1_vocab = s1["model"]["vocab"]
     s1_merges = [tuple(m) for m in s1["model"]["merges"]]
 
-    # Stage 2: cross-word byte-level BPE seeded from stage 1.
-    tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges))
-    tok2.pre_tokenizer = _pretok(_SUPERBPE_STAGE2_REGEX)
-    tok2.decoder = _decoders.ByteLevel()
-    trainer2 = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
-    tok2.train(files=[str(corpus_path)], trainer=trainer2)
+    # --- Stage 2: token-level BPE extension with permissive pre-tokenizer ---
+    # Switch tok1 to stage-2 pre-tokenizer so it encodes with cross-word
+    # segmentation while still applying stage-1 merges within each segment.
+    tok1.pre_tokenizer = _pretok(_SUPERBPE_STAGE2_REGEX)
+    final_vocab, s2_merges = _superbpe_extend_stage2(
+        tok1, corpus_path, s1_vocab, s1_merges, stage2_budget
+    )
 
-    HFAdapter(
-        tok2,
-        algorithm="superbpe",
-        special_tokens=DEFAULT_SPECIAL_TOKENS,
-        is_byte_level=True,
-    ).save(output_dir)
+    # Build the final tokenizer with the hierarchical merge list.
+    final_merges = s1_merges + s2_merges
+    tok_final = Tokenizer(BPE(vocab=final_vocab, merges=final_merges))
+    tok_final.pre_tokenizer = _pretok(_SUPERBPE_STAGE2_REGEX)
+    tok_final.decoder = _decoders.ByteLevel()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tok_final.save(str(output_dir / _TOKENIZER_FILENAME))
+    # Store stage1_merge_count so tests/diagnostics can identify the boundary.
+    (output_dir / _CONFIG_FILENAME).write_text(
+        json.dumps({
+            "algorithm": "superbpe",
+            "special_tokens": DEFAULT_SPECIAL_TOKENS,
+            "is_byte_level": True,
+            "stage1_merge_count": len(s1_merges),
+        }),
+        encoding="utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +576,10 @@ def _load_unigram(artifact_dir: Path) -> HFAdapter:
 
 
 def _load_superbpe(artifact_dir: Path) -> HFAdapter:
-    return _load_hf(artifact_dir, "superbpe")
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(str(artifact_dir / _TOKENIZER_FILENAME))
+    return HFAdapter(tok, algorithm="superbpe", is_byte_level=True)
 
 
 def _load_tiktoken(artifact_dir: Path) -> HFAdapter:
