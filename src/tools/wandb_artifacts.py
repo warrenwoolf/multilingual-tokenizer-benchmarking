@@ -120,7 +120,29 @@ def pull_tokenizer_artifacts(
     api = wandb.Api()
     project_path = f"{entity}/{project}" if entity else project
     try:
-        artifacts = api.artifacts(type_name=ARTIFACT_TYPE, project=project_path)
+        # Prefer the project-scoped listing when available: this returns
+        # artifact *collections* for the given project and type, which we
+        # then expand to per-artifact versions. This avoids accidental
+        # collisions with artifacts of the same name in other projects.
+        collections = api.artifact_collections(project_name=project_path, type_name=ARTIFACT_TYPE)
+        artifacts = []
+        for coll in collections:
+            coll_name = getattr(coll, "name", None) or getattr(coll, "collection", None) or str(coll)
+            # `api.artifacts` expects `type_name` and `name` (example: "entity/project/artifact_name")
+            artifacts_iter = api.artifacts(type_name=ARTIFACT_TYPE, name=f"{project_path}/{coll_name}")
+            for a in artifacts_iter:
+                artifacts.append(a)
+    except AttributeError:
+        # Older/newer wandb clients may not expose `artifact_collections`.
+        # Fall back to calling `artifacts(type_name, name=...)` directly
+        # using the project path as the name prefix (best-effort).
+        try:
+            artifacts = api.artifacts(type_name=ARTIFACT_TYPE, name=project_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not list artifacts in W&B project '{project_path}'. "
+                f"Check that the project exists and WANDB_API_KEY is set. Original error: {exc}"
+            ) from exc
     except Exception as exc:
         raise RuntimeError(
             f"Could not list artifacts in W&B project '{project_path}'. "
