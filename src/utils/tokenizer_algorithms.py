@@ -343,17 +343,25 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
 
     Stage 1 — standard BPE with Whitespace pre-tokenizer (90% of vocab budget).
               Merges are constrained to word boundaries.
-    Stage 2 — reseed from stage-1 vocab+merges, then continue training without
-              a pre-tokenizer so the BPE trainer sees spaces as ordinary
-              characters and can discover merges that cross word boundaries.
+    Stage 2 — reseed from stage-1 vocab+merges, train on a short-segment corpus
+              (SEGMENT_WORDS words per line) with no pre-tokenizer so spaces are
+              ordinary characters and BPE can discover cross-word merges.
 
-    No external repo, Rust toolchain, or patched tokenizers fork is needed.
+    Why short segments?  FineWeb stores each document as one long line.  Without
+    a pre-tokenizer every document becomes a single BPE "word" — potentially
+    thousands of characters — making each merge step prohibitively slow.
+    Splitting into short segments keeps unit lengths comparable to stage-1 words
+    while still allowing merges across spaces within each segment.
     """
     import json as _json
+    import tempfile as _tempfile
     from tokenizers import Tokenizer, decoders
     from tokenizers.models import BPE
-    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.pre_tokenizers import Split, Whitespace
     from tokenizers.trainers import BpeTrainer
+
+    # 6 words ≈ 30–40 chars per segment: fast BPE, captures common phrases.
+    SEGMENT_WORDS = 6
 
     stage1_size = int(vocab_size * 0.9)
 
@@ -364,19 +372,38 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
     trainer1 = BpeTrainer(vocab_size=stage1_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
     tok1.train(files=[str(corpus_path)], trainer=trainer1)
 
-    # Pull the stage-1 vocab and merges out of the serialised model so we can
-    # seed a fresh BPE that has no pre-tokenizer for stage 2.
     s1 = _json.loads(tok1.to_str())
-    s1_vocab = s1["model"]["vocab"]                                    # dict[str, int]
-    s1_merges = [tuple(m) for m in s1["model"]["merges"]]  # list[(str, str)]
+    s1_vocab = s1["model"]["vocab"]
+    s1_merges = [tuple(m) for m in s1["model"]["merges"]]
 
-    # Stage 2: cross-word extension.
-    tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges, unk_token="<unk>"))
-    tok2.decoder = decoders.BPEDecoder()
-    # No pre_tokenizer → spaces are treated as ordinary characters, allowing
-    # new merges to span word boundaries.
-    trainer2 = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
-    tok2.train(files=[str(corpus_path)], trainer=trainer2)
+    # Build stage-2 corpus: split each (long) document line into short segments
+    # so BPE "words" are bounded in length.  Spaces are kept inside segments so
+    # the trainer can merge across original word boundaries.
+    tmp = _tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+    )
+    try:
+        with corpus_path.open("r", encoding="utf-8", errors="replace") as fin:
+            for line in fin:
+                words = line.split()
+                for i in range(0, len(words), SEGMENT_WORDS):
+                    seg = " ".join(words[i : i + SEGMENT_WORDS])
+                    if seg:
+                        tmp.write(seg + "\n")
+        tmp.close()
+
+        # Stage 2: cross-word BPE seeded from stage 1.
+        # Split on newlines so the trailing \n of each segment is stripped before
+        # BPE sees it — otherwise \n leaks into the token vocabulary.
+        # Spaces inside each segment remain as ordinary characters, allowing
+        # merges to cross word boundaries.
+        tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges, unk_token="<unk>"))
+        tok2.pre_tokenizer = Split("\n", behavior="removed")
+        tok2.decoder = decoders.BPEDecoder()
+        trainer2 = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
+        tok2.train(files=[tmp.name], trainer=trainer2)
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
 
     HFAdapter(tok2, algorithm="superbpe").save(output_dir)
 
