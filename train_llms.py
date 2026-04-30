@@ -62,9 +62,9 @@ LLM_CONFIG = LLMConfig(
     d_ff=2048,
     ctx_len=512,
     train_tokens=1_000_000_000,
-    batch_size=256,
-    learning_rate=7e-4,
-    min_lr=7e-5,
+    batch_size=128,
+    learning_rate=5e-4,
+    min_lr=5e-5,
     wandb_project=WANDB_PROJECT,
     wandb_entity=WANDB_ENTITY,
 )
