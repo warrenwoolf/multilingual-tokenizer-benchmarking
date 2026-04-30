@@ -82,6 +82,15 @@ def _token_texts_for_ids(tokenizer: Any, token_ids: list[int]) -> list[str]:
     return [str(i) for i in token_ids]
 
 
+def _truncate_display(text: str, limit: int = 100) -> str:
+    """Return a possibly-truncated representation suitable for printing."""
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
 def _print_sample_roundtrip(artifact_dir: Path, algorithm: str, corpus_path: Path, label: str) -> None:
     tokenizer = load_tokenizer(artifact_dir, algorithm)
     source_text = _first_nonempty_line(corpus_path)
@@ -89,9 +98,14 @@ def _print_sample_roundtrip(artifact_dir: Path, algorithm: str, corpus_path: Pat
     token_texts = _token_texts_for_ids(tokenizer, token_ids)
     detokenized = tokenizer.decode(token_ids)
 
-    print(f"[{label}] sample original: {source_text!r}")
-    print(f"[{label}] sample tokens: {token_texts}")
-    print(f"[{label}] sample detokenized: {detokenized!r}")
+    # Truncate long samples for compact logging in quick runs / Colab
+    truncated_source = _truncate_display(source_text, limit=100)
+    joined_tokens = " ".join(token_texts)
+    truncated_tokens = _truncate_display(joined_tokens, limit=100)
+    truncated_detok = _truncate_display(detokenized, limit=100)
+    print(f"[{label}] sample original: {truncated_source!r}")
+    print(f"[{label}] sample tokens: {truncated_tokens!r}")
+    print(f"[{label}] sample detokenized: {truncated_detok!r}")
 
     # Re-encode to verify round-trip consistency (IDs should match).
     # Note: space normalization is acceptable — some tokenizers normalize whitespace.

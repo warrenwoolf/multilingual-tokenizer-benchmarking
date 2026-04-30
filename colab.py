@@ -51,8 +51,18 @@ os.environ["SUPERBPE_REPO"] = SUPERBPE_REPO
 !apt-get install -y -qq build-essential curl python3-venv
 !curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 os.environ["PATH"] = "/root/.cargo/bin:" + os.environ.get("PATH", "")
-!rustc --version
-!cargo --version
+import textwrap
+try:
+    r = subprocess.run(["rustc", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    print(f"[colab] rustc: {r.stdout.strip()}")
+except Exception:
+    pass
+
+try:
+    c = subprocess.run(["cargo", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    print(f"[colab] cargo: {c.stdout.strip()}")
+except Exception:
+    pass
 
 # 2. Persist HuggingFace token from Colab Secrets into tokens/hf_token
 try:
@@ -67,10 +77,10 @@ except Exception:
 
 # 3. Install dependencies (editable so any tweaks take effect immediately)
 print("[colab] Installing main Python dependencies...", flush=True)
-!pip install -e .
+!pip install -q -e .
 if RUN_LLM_EVAL:
     print("[colab] Installing LLM extras...", flush=True)
-    !pip install -e ".[llm]" wandb
+    !pip install -q -e ".[llm]" wandb
 
 # 3b. Install the official SuperBPE repo if requested. This pulls the patched
 # tokenizers submodule, builds its Rust-backed Python extension, and keeps it in
@@ -78,8 +88,18 @@ if RUN_LLM_EVAL:
 if "superbpe" in ALGORITHMS.split(","):
     !chmod +x scripts/install_superbpe.sh
     os.environ["PYTHON"] = sys.executable
-    print("[colab] Installing official SuperBPE repo...", flush=True)
-    subprocess.run(["bash", "scripts/install_superbpe.sh"], check=True)
+    print("[colab] Installing official SuperBPE repo... (logs suppressed)", flush=True)
+    try:
+        res = subprocess.run(["bash", "scripts/install_superbpe.sh"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if res.returncode != 0:
+            print("[colab] SuperBPE install failed — showing captured output:")
+            print(res.stdout)
+            raise subprocess.CalledProcessError(res.returncode, res.args)
+        else:
+            # keep a minimal success line
+            print("[colab] SuperBPE installed successfully.")
+    except subprocess.CalledProcessError:
+        raise
     superbpe_repo_abs = os.path.abspath(SUPERBPE_REPO)
     if not os.path.isdir(superbpe_repo_abs):
         raise RuntimeError(
