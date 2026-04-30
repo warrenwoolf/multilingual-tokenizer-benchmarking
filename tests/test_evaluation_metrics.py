@@ -82,29 +82,20 @@ def test_vocabulary_coverage_no_words_is_one():
 
 
 def test_vocabulary_coverage_byte_level_is_always_one():
-    """Byte-level tokenizers represent every word without UNK.
+    """ByT5Adapter represents every word without UNK.
 
-    The vocab contains only individual byte characters as keys (realistic
-    for ByT5/tiktoken). No multi-character word will appear as a vocab key,
-    so a naive membership check would return 0.0 — the function must return
-    1.0 by recognising that every UTF-8 byte sequence is representable.
+    ByT5's vocab keys are individual bytes ('\x00'–'\xff' plus specials),
+    so multi-character words like 'hello' are absent from get_vocab().
+    A naive membership check would return 0.0; the function must return 1.0
+    because every UTF-8 byte sequence is representable without UNK.
     """
+    from src.utils.tokenizer_algorithms import ByT5Adapter
 
-    class ByteLevelTokenizer:
-        is_byte_level = True
-
-        def encode(self, text: str) -> list[int]:
-            return list(text.encode("utf-8"))
-
-        def get_vocab(self) -> dict:
-            # Realistic byte-level vocab: one entry per byte value.
-            # Multi-character words (e.g. "hello") are not keys here.
-            return {chr(i): i for i in range(256)}
-
-    tok = ByteLevelTokenizer()
-    # "hello" has 5 chars — not a key in the byte vocab, but representable.
+    tok = ByT5Adapter()
+    # 'hello' is not a vocab key but is fully representable as bytes.
     assert vocabulary_coverage(tok, ["hello"]) == 1.0
     assert vocabulary_coverage(tok, ["hi world"]) == 1.0
+    # Non-ASCII — still representable via multi-byte UTF-8 sequences.
     assert vocabulary_coverage(tok, ["café naïve"]) == 1.0
 
 
