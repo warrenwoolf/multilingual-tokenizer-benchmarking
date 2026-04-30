@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-import types
-
 import pytest
 
 from src.prepare_data.download_datasets import (
@@ -47,27 +44,28 @@ def test_download_language_rejects_unknown_language(tmp_path):
 
 
 def test_download_language_writes_train_and_eval(tmp_path, monkeypatch):
-    """Verify streaming + budget split between train.txt and eval.txt."""
-    docs = [{"text": chr(ord("a") + i) * 100_000} for i in range(8)]  # ~800 KB
+    """Verify streaming + row-count split between train.txt and eval.txt."""
+    docs = [{"text": chr(ord("a") + i) * 100_000} for i in range(8)]
 
-    def fake_load_dataset(repo, name, split, streaming):
+    def fake_load_dataset(repo, name=None, split=None, streaming=None, token=None):
         assert streaming is True
         return iter(docs)
 
-    fake_datasets = types.ModuleType("datasets")
-    fake_datasets.load_dataset = fake_load_dataset
-    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+    import src.prepare_data.download_datasets as dl_mod
+    monkeypatch.setattr(dl_mod, "load_dataset", fake_load_dataset)
 
-    paths = download_language(
-        "en", tmp_path, train_budget_mb=0.3, eval_budget_mb=0.15
-    )
+    paths = download_language("en", tmp_path, max_train_rows=3, max_eval_rows=2)
     assert paths["train"].exists() and paths["eval"].exists()
 
-    train_bytes = paths["train"].read_bytes()
-    eval_bytes = paths["eval"].read_bytes()
-    # train ~ 300 KB cap, eval ~ 150 KB cap; each doc is 100 KB.
-    assert len(train_bytes) <= 0.3 * 1024 * 1024 + 1000
-    assert len(eval_bytes) <= 0.15 * 1024 * 1024 + 1000
-    # Train is filled first, so eval starts at a later doc.
-    assert train_bytes.startswith(b"a" * 100)
-    assert eval_bytes[:1] != b"a"
+    train_text = paths["train"].read_text(encoding="utf-8")
+    eval_text = paths["eval"].read_text(encoding="utf-8")
+
+    # Exactly 3 rows in train, 2 in eval.
+    train_lines = [l for l in train_text.splitlines() if l]
+    eval_lines = [l for l in eval_text.splitlines() if l]
+    assert len(train_lines) == 3
+    assert len(eval_lines) == 2
+
+    # Train starts with doc 0 (aaa...), eval starts with doc 3 (ddd...).
+    assert train_text.startswith("a" * 100)
+    assert eval_text.startswith("d" * 100)
