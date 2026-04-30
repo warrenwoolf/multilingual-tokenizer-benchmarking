@@ -10,7 +10,7 @@ from pathlib import Path
 from src.tools.download_data import download_all_languages
 
 # --- config ----------------------------------------------------------------
-LANGUAGES = ["en", "zh", "tr"]
+LANGUAGES = ["en", "zh", "hu"]
 MAX_TRAIN_ROWS = 500_000
 MAX_EVAL_ROWS = 25_000
 DATA_DIR = Path("data")

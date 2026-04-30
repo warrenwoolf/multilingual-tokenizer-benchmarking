@@ -36,13 +36,13 @@ MULTILINGUAL_SAMPLES = [
     "प्राकृतिक भाषा प्रसंस्करण के लिए अच्छे टोकनाइज़र की आवश्यकता होती है।",
     "शोधकर्ता विभिन्न भाषाओं में टोकनाइज़ेशन एल्गोरिदम की तुलना करते हैं।",
     "हिंदी एक समृद्ध आकारिकी वाली भाषा है जिसमें अनेक रूप मौजूद हैं।",
-    # Turkish
-    "Hızlı kahverengi tilki tembel köpeğin üzerinden her sabah atlar ve koşar.",
-    "Türkiye, Avrupa ve Asya kıtalarını birbirine bağlayan önemli bir ülkedir.",
-    "Doğal dil işleme, morfolojik olarak zengin diller için oldukça zordur.",
-    "Araştırmacılar farklı diller üzerinde tokenlaştırma algoritmalarını karşılaştırır.",
-    "Sözlük boyutunun seçimi, dil modelinin kalitesini doğrudan etkileyen bir faktördür.",
-    "Türkçe sondan eklemeli bir dil olduğu için kelime yapıları oldukça karmaşıktır.",
+    # Hungarian
+    "A gyors barna róka átugorja a lusta kutyát minden reggel a folyónál.",
+    "Magyarország Európa közepén fekszik és gazdag történelmi örökséggel rendelkezik.",
+    "A természetes nyelvfeldolgozás jó tokenizálókat igényel a morfológia kezeléséhez.",
+    "A kutatók különböző nyelveken hasonlítják össze a tokenizálási algoritmusokat.",
+    "A szótárméret megválasztása közvetlen hatással van a nyelvi modell minőségére.",
+    "A magyar ragozó nyelv, amelyben a szóalakok szerkezete meglehetősen összetett.",
 ]
 
 

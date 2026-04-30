@@ -188,12 +188,17 @@ def train_tokenizer(
     vocab_size: int,
     output_dir: Path,
     language: str | None = None,
+    morphynet_cache_dir: Path | None = None,
 ) -> None:
     """Train a tokenizer and persist it to output_dir.
 
     ``language`` is required for algorithms that need a per-language asset
     (currently only MorphBPE, which needs a morpheme segmenter); other
     algorithms ignore it.
+
+    ``morphynet_cache_dir`` controls where MorphyNet data is cached for
+    English MorphBPE. Defaults to ``~/.cache/morphynet``; pass a tmp
+    directory in tests to avoid network access.
     """
     if algorithm not in SUPPORTED_ALGORITHMS:
         raise ValueError(f"Unknown algorithm {algorithm!r}. Choose from {SUPPORTED_ALGORITHMS}")
@@ -205,7 +210,7 @@ def train_tokenizer(
                 "MorphBPE training requires a `language` argument so the "
                 "right morpheme segmenter can be selected."
             )
-        _train_morphbpe(Path(corpus_path), vocab_size, output_dir, language)
+        _train_morphbpe(Path(corpus_path), vocab_size, output_dir, language, morphynet_cache_dir=morphynet_cache_dir)
         return
     dispatch = {
         "bpe": _train_bpe,
@@ -300,33 +305,66 @@ def _train_tiktoken(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
 
 
 def _train_morphbpe(
-    corpus_path: Path, vocab_size: int, output_dir: Path, language: str
+    corpus_path: Path,
+    vocab_size: int,
+    output_dir: Path,
+    language: str,
+    morphynet_cache_dir: Path | None = None,
 ) -> None:
     """MorphBPE (Asgari et al. 2025).
 
-    The paper's Algorithm 1 is: initialize the vocabulary with characters,
-    morpheme-segment the corpus, then run BPE while skipping any candidate
-    pair that would cross a morpheme boundary. We implement that constraint
-    by morpheme-segmenting the corpus first (each word becomes its
-    whitespace-joined morphemes) and then training standard HF BPE on the
-    rewritten corpus. The Whitespace pre-tokenizer guarantees BPE never
-    counts or merges a pair across a morpheme boundary, so it's equivalent.
+    The paper's Algorithm 1 trains BPE on the *original* corpus while
+    filtering out any candidate merge whose pair spans a morpheme boundary.
+    We approximate that by morpheme-segmenting the corpus first (each word
+    becomes its whitespace-joined morphemes) and then training standard HF
+    BPE on the rewritten corpus.  The Whitespace pre-tokenizer guarantees
+    BPE never counts or merges a pair across a morpheme boundary during
+    training, which is equivalent to Algorithm 1 for the encode path.
 
-    See src/utils/morpheme_segmentation.py for the per-language segmenter.
+    Training guarantee: no cross-morpheme merge is ever *learned* because
+    the Whitespace pre-tokenizer cannot count pairs across the inserted
+    spaces.  This is equivalent to Algorithm 1 for the training path.
+
+    Inference caveat: at inference time words are presented without spaces,
+    so BPE may cross morpheme boundaries by composing within-morpheme merges
+    (e.g. 'run'+'n'+'ing' merges produce 'ning' which straddles the n|ing
+    boundary).  The paper's inline-filter approach avoids this by filtering
+    merge candidates during training rather than rewriting the corpus; our
+    preprocessing approximation is weaker on the inference side.
+
+    Decode limitation: the segmented training corpus does not distinguish
+    original word-boundary spaces from morpheme-boundary spaces, so the
+    learned tokenizer cannot reconstruct inter-word spaces on decode.
+    Single-word decode is lossless (morphemes concatenate correctly), but
+    multi-word decode drops spaces, e.g. "playing tennis" round-trips as
+    "playingtennis".  The BPB and fertility evaluation pipelines only call
+    encode(), so this does not affect benchmark results.  The paper's
+    in-training-filter approach avoids this by operating on the original
+    corpus; a future improvement would implement Algorithm 1 directly.
+
+    Note on end_of_word_suffix: we deliberately do NOT set this on the
+    BpeTrainer here.  The segmented corpus treats each morpheme as a
+    "word"; adding </w> to every morpheme-final character would make
+    inference-time tokenization incorrect (the </w> marker appears at
+    morpheme ends in training but not in raw words at inference).
+
+    Per-language segmenters (src/utils/morpheme_segmentation.py):
+      en — MorphyNet gold inflectional lookup (~650k entries, downloaded once).
+      hu — Morfessor 2.0 trained unsupervisedly on the corpus.
+
     The official llm-lab-org/MorphBPE repo was an empty placeholder at the
     time of writing, so this is a from-scratch implementation of the
     paper's algorithm rather than a wrapper around official code.
     """
+    from src.utils.morpheme_segmentation import segment_corpus
     from tokenizers import Tokenizer, decoders
     from tokenizers.models import BPE
     from tokenizers.pre_tokenizers import Whitespace
     from tokenizers.trainers import BpeTrainer
 
-    from src.utils.morpheme_segmentation import segment_corpus
-
     with tempfile.TemporaryDirectory(prefix="morphbpe_") as td:
         segmented = Path(td) / "segmented.txt"
-        segment_corpus(corpus_path, segmented, language=language)
+        segment_corpus(corpus_path, segmented, language=language, morphynet_cache_dir=morphynet_cache_dir)
 
         tok = Tokenizer(BPE(unk_token="<unk>"))
         tok.pre_tokenizer = Whitespace()

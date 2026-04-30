@@ -23,7 +23,7 @@ Python ≥ 3.11 required.
 
 ## Pipeline Overview
 
-The project benchmarks 7 tokenizer algorithms across 3 languages that represent different morphological typologies (English/analytic, Mandarin/super-analytic, Turkish/agglutinative). The full pipeline is:
+The project benchmarks 7 tokenizer algorithms across 3 languages that represent different morphological typologies (English/analytic, Mandarin/super-analytic, Hungarian/agglutinative). The full pipeline is:
 
 ```
 download_data.py → data/{lang}/{train,eval}.txt
@@ -67,7 +67,7 @@ Wraps Morfessor 2.0 with a per-word-type cache (~200k entries). Morfessor is tra
 
 Pre-LN GPT decoder (~50M params): `d_model=512, n_layers=8, n_heads=8, ctx_len=512`. Training: 1B tokens, AdamW, cosine LR + warmup, batch size 512. Evaluation reports **bits-per-byte (BPB)** — tokenizer-invariant by normalizing cross-entropy by raw UTF-8 byte count. W&B integration is optional (token in `tokens/wandb.token`).
 
-FLORES-200 OOD eval uses ISO 639-3 + script codes: `eng_Latn`, `zho_Hans`, `tur_Latn`.
+FLORES-200 OOD eval uses ISO 639-3 + script codes: `eng_Latn`, `zho_Hans`, `hun_Latn`.
 
 ### Tools layer (`src/tools/`)
 
@@ -78,7 +78,7 @@ Thin orchestration scripts that iterate job combinations and call the utils laye
 
 ### Tests (`tests/`)
 
-173 contract/unit tests, ~10s total. `conftest.py` provides a multilingual corpus fixture (English, Russian, Hindi, Turkish samples). `test_tokenizer_contract.py` is parametrized over all trainable algorithms and verifies encode/decode round-trip, vocab size, pickling, and batch consistency. SuperBPE and MorphBPE are skipped in contract tests.
+187 contract/unit tests, ~10s total. `conftest.py` provides a multilingual corpus fixture (English, Russian, Hindi, Hungarian samples). `test_tokenizer_contract.py` is parametrized over all trainable algorithms and verifies encode/decode round-trip, vocab size, pickling, and batch consistency. SuperBPE and MorphBPE are skipped in contract tests.
 
 ## Data & Artifacts
 

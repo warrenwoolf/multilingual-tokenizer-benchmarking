@@ -14,23 +14,23 @@ from src.prepare_data.download_datasets import (
 
 
 def test_language_configs_includes_paper_languages():
-    # English + super-analytic Mandarin + agglutinative Turkish are the
+    # English + super-analytic Mandarin + agglutinative Hungarian are the
     # v1 focus. ru/hi remain available as fallbacks.
-    for lang in ("en", "zh", "tr"):
+    for lang in ("en", "zh", "hu"):
         assert lang in LANGUAGE_CONFIGS
 
 
 def test_language_configs_fineweb_split():
     # English comes from the original FineWeb (FineWeb 2 excludes English).
     assert LANGUAGE_CONFIGS["en"]["repo"] == "HuggingFaceFW/fineweb"
-    for lang in ("zh", "tr", "ru", "hi"):
+    for lang in ("zh", "hu", "ru", "hi"):
         assert LANGUAGE_CONFIGS[lang]["repo"] == "HuggingFaceFW/fineweb-2"
 
 
 def test_language_configs_flores_codes():
     # FineWeb 2 uses FLORES {iso639-3}_{script} codes.
     assert LANGUAGE_CONFIGS["zh"]["config"] == "cmn_Hani"
-    assert LANGUAGE_CONFIGS["tr"]["config"] == "tur_Latn"
+    assert LANGUAGE_CONFIGS["hu"]["config"] == "hun_Latn"
     assert LANGUAGE_CONFIGS["ru"]["config"] == "rus_Cyrl"
     assert LANGUAGE_CONFIGS["hi"]["config"] == "hin_Deva"
 

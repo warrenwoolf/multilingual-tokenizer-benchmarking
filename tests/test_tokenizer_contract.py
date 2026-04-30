@@ -201,7 +201,74 @@ def english_corpus(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def morphbpe_tokenizer(english_corpus, tmp_path_factory):
+def morphynet_cache_dir(tmp_path_factory) -> Path:
+    """Minimal MorphyNet-format TSVs for English and Hungarian.
+
+    Written to a tmp dir so tests never hit the network. Format mirrors the
+    real files: lemma TAB inflected TAB features TAB pipe-separated morphemes.
+    """
+    cache = tmp_path_factory.mktemp("morphynet")
+
+    en_rows = [
+        "run\trunning\tV|V.PTCP;PRS\trun|n|ing",
+        "run\trunner\tN\trun|n|er",
+        "run\trunners\tN|PL\trun|n|er|s",
+        "run\truns\tV|PRS;3;SG\trun|s",
+        "happy\thappiness\tN\thappi|ness",
+        "happy\thappily\tR\thappi|ly",
+        "happy\thappier\tJ\thappi|er",
+        "happy\tunhappiness\tN\tun|happi|ness",
+        "sad\tsadness\tN\tsad|ness",
+        "token\ttokenization\tN\ttoken|iz|ation",
+        "token\ttokenizer\tN\ttoken|iz|er",
+        "token\ttokenizers\tN|PL\ttoken|iz|er|s",
+        "token\ttokenized\tV|PST\ttoken|iz|ed",
+        "token\ttokenizes\tV|PRS;3;SG\ttoken|iz|es",
+        "tokenize\ttokenize\tV\ttoken|ize",
+        "process\tpreprocessing\tV|V.PTCP;PRS\tpre|process|ing",
+        "process\tpostprocessing\tV|V.PTCP;PRS\tpost|process|ing",
+        "process\treprocessing\tV|V.PTCP;PRS\tre|process|ing",
+        "process\tprocessing\tV|V.PTCP;PRS\tprocess|ing",
+        "comfort\tdiscomfort\tN\tdis|comfort",
+        "comfort\tcomfortable\tJ\tcomfort|able",
+        "comfort\tuncomfortable\tJ\tun|comfort|able",
+        "bear\tunbearable\tJ\tun|bear|able",
+        "whelm\toverwhelming\tV|V.PTCP;PRS\tover|whelm|ing",
+        "quick\tquickly\tR\tquick|ly",
+        "sell\tsells\tV|PRS;3;SG\tsell|s",
+        "learn\tlearning\tV|V.PTCP;PRS\tlearn|ing",
+        "train\ttraining\tV|V.PTCP;PRS\ttrain|ing",
+        "represent\trepresentations\tN|PL\tre|present|ation|s",
+        "require\trequires\tV|PRS;3;SG\trequire|s",
+        "compare\tcompares\tV|PRS;3;SG\tcompare|s",
+        "reveal\treveals\tV|PRS;3;SG\treveal|s",
+        "control\tcontrols\tV|PRS;3;SG\tcontrol|s",
+        "split\tsplits\tV|PRS;3;SG\tsplit|s",
+        "jump\tjumps\tV|PRS;3;SG\tjump|s",
+    ]
+    (cache / "eng.inflectional.v1.tsv").write_text("\n".join(en_rows), encoding="utf-8")
+
+    # Stub Hungarian file — a handful of real inflectional forms so the
+    # MorphyNet loader path is exercised without a live download.
+    hu_rows = [
+        "ház\tházak\tN|PL\tház|ak",
+        "ház\tházban\tN|IN+ESS\tház|ban",
+        "ház\tháztól\tN|ELA\tház|tól",
+        "ember\tembernek\tN|DAT\tember|nek",
+        "ember\temberek\tN|PL\tember|ek",
+        "tanul\ttanulnak\tV|PRS;3;PL\ttanul|nak",
+        "tanul\ttanulás\tN\ttanul|ás",
+        "szép\tszépen\tR\tszép|en",
+    ]
+    (cache / "hu.inflectional.segmentation.v1.tsv").write_text(
+        "\n".join(hu_rows), encoding="utf-8"
+    )
+
+    return cache
+
+
+@pytest.fixture(scope="module")
+def morphbpe_tokenizer(english_corpus, morphynet_cache_dir, tmp_path_factory):
     out = tmp_path_factory.mktemp("artifact_morphbpe")
     train_tokenizer(
         corpus_path=english_corpus,
@@ -209,6 +276,7 @@ def morphbpe_tokenizer(english_corpus, tmp_path_factory):
         vocab_size=VOCAB_SIZE,
         output_dir=out,
         language="en",
+        morphynet_cache_dir=morphynet_cache_dir,
     )
     return load_tokenizer(out, algorithm="morphbpe")
 
@@ -251,3 +319,211 @@ def test_morphbpe_rejects_unsupported_language(english_corpus, tmp_path):
     requesting it should fail loudly rather than silently degrade to BPE."""
     with pytest.raises(NotImplementedError, match="zh"):
         train_tokenizer(english_corpus, "morphbpe", 500, tmp_path / "x", language="zh")
+
+
+# ---------- BPE decode limitation ------------------------------------------
+# BPE is trained without end_of_word_suffix (adding it introduces non-
+# determinism in HF tokenizers' tie-breaking, breaking the training
+# determinism contract).  As a result, BPEDecoder cannot locate word
+# boundaries and concatenates all subwords without spaces.  This does not
+# affect the BPB or fertility metrics (both use encode-only), but it means
+# decode() is lossy for multi-word inputs.  This test documents that known
+# behaviour so we notice if it ever accidentally changes.
+
+
+def test_bpe_decode_drops_interword_spaces(tiny_corpus, tmp_path):
+    """Documents the known decode limitation: inter-word spaces are dropped."""
+    out = tmp_path / "bpe_decode_test"
+    out.mkdir()
+    train_tokenizer(tiny_corpus, "bpe", vocab_size=VOCAB_SIZE, output_dir=out)
+    tok = load_tokenizer(out, algorithm="bpe")
+
+    text = "Hello world"
+    decoded = tok.decode(tok.encode(text))
+    # Spaces are dropped; the decode is concatenative.
+    assert " " not in decoded, (
+        "BPE decode is unexpectedly preserving spaces — the end_of_word_suffix "
+        "limitation may have been fixed; update this test and the docstring in "
+        "_train_bpe if so."
+    )
+
+
+# ---------- MorphBPE decode behaviour --------------------------------------
+# Documents (and pins) the known limitation: because the segmented training
+# corpus does not distinguish morpheme-boundary spaces from word-boundary
+# spaces, the trained tokenizer cannot reconstruct inter-word spaces on
+# decode().  Single-word inputs round-trip correctly; multi-word inputs lose
+# the space.  The BPB / fertility pipelines only call encode(), so this does
+# not affect benchmark results.
+
+
+def test_morphbpe_single_word_decode_is_lossless(morphbpe_tokenizer):
+    """Single-word inputs: decode(encode(word)) == word (morphemes concatenate)."""
+    for word in ["happiness", "tokenization", "uncomfortable", "running"]:
+        decoded = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(word))
+        assert decoded == word, (
+            f"MorphBPE single-word decode should be lossless: {word!r} -> {decoded!r}"
+        )
+
+
+def test_morphbpe_multiword_decode_drops_spaces(morphbpe_tokenizer):
+    """Multi-word decode is known to lose inter-word spaces (documented limitation)."""
+    text = "playing tennis"
+    decoded = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(text))
+    # The limitation: spaces are dropped.
+    assert " " not in decoded, (
+        "If this assertion fails, MorphBPE decode now preserves spaces — "
+        "update the limitation note in _train_morphbpe and this test."
+    )
+
+
+# ---------- MorphBPE morpheme-boundary constraint --------------------------
+# Verifies that BPE does not create tokens that cross morpheme boundaries.
+#
+# The production path uses MorphyNet gold segmentations for both English and
+# Hungarian, so the invariant test uses the English corpus + morphynet_cache_dir
+# fixture (no network access required).
+#
+# The agglutinative corpus and Morfessor tests below are kept as unit tests
+# for the internal Morfessor utilities (_train_morfessor, _segment_word),
+# which are still present in the module for research use.
+
+
+def _make_agglutinative_corpus(path: Path) -> None:
+    """Write a corpus rich enough for Morfessor to discover morpheme splits.
+
+    Morfessor's MDL objective only segments words when re-using morpheme pieces
+    across many word types reduces the total encoding cost.  We simulate a
+    Finnish-style agglutinative paradigm: many roots × many case/number/tense
+    suffixes (including vowel-harmony variants), resulting in 500+ word types
+    with clearly shared sub-strings.
+
+    Vowel-harmony pairs (e.g. "lle"/"llä", "lta"/"ltä") are essential:
+    Morfessor finds the shared root by observing that "auto", "talo", etc.
+    each appear with both variants.  Without this variety the MDL cost of
+    splitting exceeds its benefit.
+    """
+    roots = [
+        "auto", "talo", "kirja", "koira", "kissa", "mies", "nainen", "lapsi",
+        "maa", "puu", "katu", "koulu", "kauppa", "pankki", "ravintola",
+        "museo", "teatteri", "kirjasto",
+    ]
+    # Singular case suffixes (back-vowel / front-vowel harmony pairs)
+    case_suffixes = [
+        "",                                   # nominative
+        "n",                                  # genitive
+        "a", "ä",                             # partitive
+        "lle", "llä",                         # allative
+        "lta", "ltä",                         # ablative
+        "lla", "llä",                         # adessive
+        "sta", "stä",                         # elative
+        "han", "hen", "hin", "hon", "hun",    # illative variants
+        "ksi",                                # translative
+        "ssa", "ssä",                         # inessive
+        "ja", "jä",                           # comitative
+    ]
+    # Plural case suffixes (with "i" infix)
+    plural_suffixes = [
+        "t",           # nominative plural
+        "jen",         # genitive plural
+        "ja", "jä",    # partitive plural
+        "ille",        # allative plural
+        "ilta", "iltä",# ablative plural
+        "illa", "illä",# adessive plural
+        "ista", "istä",# elative plural
+    ]
+    import random as _random
+    rng = _random.Random(0)
+    lines = []
+    for root in roots:
+        for suffix in case_suffixes:
+            count = rng.randint(100, 3000)
+            lines.extend([root + suffix] * count)
+        for suffix in plural_suffixes:
+            count = rng.randint(50, 500)
+            lines.extend([root + "i" + suffix] * count)
+    rng.shuffle(lines)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def agglutinative_corpus(tmp_path_factory) -> Path:
+    p = tmp_path_factory.mktemp("aggl_corpus") / "train.txt"
+    _make_agglutinative_corpus(p)
+    return p
+
+
+def test_morfessor_segments_agglutinative_corpus(agglutinative_corpus):
+    """Sanity-check: Morfessor must learn to split morphemes on this corpus.
+
+    Morfessor may keep *training* words unitary (it stores an explicit analysis
+    per seen compound), but it will split *unseen* derived forms by applying
+    the morpheme inventory it learned.  We therefore probe a small set of
+    held-out words (root + plural-infix + case-suffix combinations that were
+    NOT emitted by the corpus generator) to verify the model learned a useful
+    morpheme decomposition.
+    """
+    from src.utils.morpheme_segmentation import (
+        _collect_word_counts,
+        _train_morfessor,
+    )
+    counts = _collect_word_counts(agglutinative_corpus)
+    model = _train_morfessor(counts, max_types=200_000)
+
+    # Held-out forms: root + "i" + adessive-suffix "lla" (not emitted by the
+    # corpus generator whose plural suffixes end in -lle/-ilta etc., not -illa).
+    held_out = [
+        "autoilla",    # auto + i + lla
+        "taloilla",    # talo + i + lla
+        "kouluilla",   # koulu + i + lla
+        "kirjoilla",   # kirja → kirjo + i + lla (stem change)
+        "kissoilla",   # kissa → kissoi + lla
+    ]
+    split_found = any(
+        len(model.viterbi_segment(w)[0]) > 1
+        for w in held_out
+        if w not in counts   # must be truly unseen
+    )
+    assert split_found, (
+        "Morfessor produced zero splits for held-out Finnish plural forms; "
+        "the model may not have learned root/suffix decomposition.  "
+        "MorphBPE would be identical to BPE for this corpus."
+    )
+
+
+def test_morphbpe_segment_corpus_splits_at_morpheme_boundaries(
+    morphynet_cache_dir, tmp_path_factory
+):
+    """The preprocessing approach inserts spaces at morpheme boundaries.
+
+    BPE with a Whitespace pre-tokenizer cannot count or learn merges across
+    spaces, so replacing 'running' with 'run n ing' in the training corpus
+    guarantees no cross-morpheme merge is ever learned.  This is what
+    makes the approach equivalent to Algorithm 1 of Asgari et al. 2025
+    for the *training* path.
+
+    Note: the guarantee does NOT extend to inference.  When BPE tokenizes
+    the raw word 'running' (no spaces) it can compose within-morpheme merges
+    in ways that produce cross-morpheme output tokens (e.g. 'ning').  The
+    paper's inline-filter approach avoids this; our preprocessing is
+    equivalent only for what BPE is allowed to *learn*.
+    """
+    from src.utils.morpheme_segmentation import segment_corpus
+
+    corpus = tmp_path_factory.mktemp("seg_check") / "corpus.txt"
+    corpus.write_text(
+        "running happiness tokenization comfortable\n", encoding="utf-8"
+    )
+    output = tmp_path_factory.mktemp("seg_out") / "out.txt"
+    segment_corpus(
+        corpus, output, language="en", morphynet_cache_dir=morphynet_cache_dir
+    )
+
+    result = output.read_text(encoding="utf-8").strip()
+    assert "run n ing" in result        # running   → run|n|ing
+    assert "happi ness" in result       # happiness → happi|ness
+    assert "token iz ation" in result   # tokenization → token|iz|ation
+    assert "comfort able" in result     # comfortable  → comfort|able
+    # Original unsplit forms must not appear
+    for w in ("running", "happiness", "tokenization", "comfortable"):
+        assert w not in result, f"Expected {w!r} to be split but found it whole"
