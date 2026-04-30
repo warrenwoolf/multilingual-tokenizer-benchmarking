@@ -660,8 +660,11 @@ def load_flores_devtest(language: str) -> list[str]:
     config = FLORES_CONFIGS[language]
     from datasets import load_dataset
 
+    # facebook/flores uses an old dataset script (flores.py) that newer versions
+    # of the datasets library refuse to run. facebook/flores-200 is the modern
+    # parquet-backed replacement and should be tried first.
     last_exc: Exception | None = None
-    for repo_id in ("facebook/flores", "facebook/flores-200"):
+    for repo_id in ("facebook/flores-200", "facebook/flores"):
         try:
             ds = load_dataset(repo_id, config, split="devtest", trust_remote_code=False)
             # Prefer the bare 'sentence' column; fall back to 'sentence_<config>'
