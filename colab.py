@@ -18,7 +18,7 @@
 
 # === SETTINGS ==============================================================
 REPO_URL = "https://github.com/warrenwoolf/multilingual-tokenizer-benchmarking.git"
-BRANCH = "claude/setup-paper-codebase-aKac5"  # change to "main" after merge
+BRANCH = "main" # Change this if using an unmerged branch
 REPO_DIR = "multilingual-tokenizer-benchmarking"
 
 LANGUAGES = "en,zh,tr"
