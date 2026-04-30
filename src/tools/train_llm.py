@@ -15,7 +15,9 @@ own W&B run with the artifact name as the run name and ``[lang, algo]`` tags.
 from __future__ import annotations
 
 import csv
+import gc
 import json
+import math
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -23,6 +25,31 @@ from pathlib import Path
 from src.tools.evaluate_tokenizer import parse_artifact_name
 from src.utils.llm_training import LLMConfig, train_and_evaluate
 from src.utils.tokenizer_algorithms import SUPPORTED_ALGORITHMS, load_tokenizer
+
+
+def _scale_config_for_vocab(config: LLMConfig, vocab_size: int) -> LLMConfig:
+    """Reduce batch_size (and LR proportionally) for large-vocab runs.
+
+    The LM head produces logits of shape [batch, seq_len, vocab_size], so VRAM
+    from that tensor (plus its gradient) scales linearly with vocab_size.  We
+    scale batch_size inversely with vocab_size relative to an 8 k reference,
+    snapping to a power of two, and apply the sqrt rule to keep the effective
+    learning rate calibrated.
+    """
+    ref_vocab = 8_000
+    if vocab_size <= ref_vocab:
+        return config
+    raw_bs = config.batch_size * ref_vocab / vocab_size
+    new_bs = max(8, 2 ** int(math.log2(max(1.0, raw_bs))))
+    if new_bs == config.batch_size:
+        return config
+    lr_scale = math.sqrt(new_bs / config.batch_size)
+    return replace(
+        config,
+        batch_size=new_bs,
+        learning_rate=config.learning_rate * lr_scale,
+        min_lr=config.min_lr * lr_scale,
+    )
 
 
 CSV_FIELDNAMES = [
@@ -211,6 +238,12 @@ def train_all_llms(
                 wandb_run_name=artifact.name,
                 wandb_tags=list(config.wandb_tags) + [f"lang:{lang}", f"algo:{algo}"],
             )
+            run_cfg = _scale_config_for_vocab(run_cfg, vs)
+            if run_cfg.batch_size != config.batch_size:
+                print(
+                    f"  vocab={vs:,}: batch_size scaled {config.batch_size}→{run_cfg.batch_size}, "
+                    f"lr={run_cfg.learning_rate:.2e} (was {config.learning_rate:.2e})"
+                )
             try:
                 result = train_and_evaluate_artifact(
                     artifact_dir=artifact,
@@ -227,6 +260,15 @@ def train_all_llms(
                 if not continue_on_error:
                     raise
                 continue
+            finally:
+                # Flush the CUDA allocator cache between runs regardless of
+                # success/failure so the next artifact starts with clean memory.
+                gc.collect()
+                try:
+                    import torch as _torch
+                    _torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
             row = _format_row(lang, algo, vs, config.train_tokens, result)
             writer.writerow(row)
