@@ -28,6 +28,7 @@ verifying Morfessor produces sensible segmentations on a sample.
 from __future__ import annotations
 
 import re
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -125,6 +126,8 @@ def segment_corpus(
     cache: dict[str, list[str]] = {}
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    n_split = 0  # word tokens that were split into 2+ morphemes
+    n_total = 0
     with (
         open(corpus_path, "r", encoding="utf-8") as fin,
         open(output_path, "w", encoding="utf-8") as fout,
@@ -136,6 +139,21 @@ def segment_corpus(
                 continue
             pieces: list[str] = []
             for w in words:
-                pieces.extend(_segment_word(model, w, cache))
+                morphemes = _segment_word(model, w, cache)
+                pieces.extend(morphemes)
+                n_total += 1
+                if len(morphemes) > 1:
+                    n_split += 1
             fout.write(" ".join(pieces))
             fout.write("\n")
+
+    if n_total > 0 and n_split == 0:
+        warnings.warn(
+            f"Morfessor produced no morpheme splits for language {language!r} "
+            f"({n_total} word tokens checked). MorphBPE will be equivalent to "
+            f"plain BPE for this corpus. Morfessor works best on agglutinative "
+            f"languages (Turkish, Finnish) with large, morphologically diverse "
+            f"corpora. For English the paper (Asgari et al. 2025) uses gold "
+            f"SIGMORPHON segmentations rather than Morfessor.",
+            stacklevel=2,
+        )

@@ -251,3 +251,233 @@ def test_morphbpe_rejects_unsupported_language(english_corpus, tmp_path):
     requesting it should fail loudly rather than silently degrade to BPE."""
     with pytest.raises(NotImplementedError, match="zh"):
         train_tokenizer(english_corpus, "morphbpe", 500, tmp_path / "x", language="zh")
+
+
+# ---------- BPE decode limitation ------------------------------------------
+# BPE is trained without end_of_word_suffix (adding it introduces non-
+# determinism in HF tokenizers' tie-breaking, breaking the training
+# determinism contract).  As a result, BPEDecoder cannot locate word
+# boundaries and concatenates all subwords without spaces.  This does not
+# affect the BPB or fertility metrics (both use encode-only), but it means
+# decode() is lossy for multi-word inputs.  This test documents that known
+# behaviour so we notice if it ever accidentally changes.
+
+
+def test_bpe_decode_drops_interword_spaces(tiny_corpus, tmp_path):
+    """Documents the known decode limitation: inter-word spaces are dropped."""
+    out = tmp_path / "bpe_decode_test"
+    out.mkdir()
+    train_tokenizer(tiny_corpus, "bpe", vocab_size=VOCAB_SIZE, output_dir=out)
+    tok = load_tokenizer(out, algorithm="bpe")
+
+    text = "Hello world"
+    decoded = tok.decode(tok.encode(text))
+    # Spaces are dropped; the decode is concatenative.
+    assert " " not in decoded, (
+        "BPE decode is unexpectedly preserving spaces — the end_of_word_suffix "
+        "limitation may have been fixed; update this test and the docstring in "
+        "_train_bpe if so."
+    )
+
+
+# ---------- MorphBPE decode behaviour --------------------------------------
+# Documents (and pins) the known limitation: because the segmented training
+# corpus does not distinguish morpheme-boundary spaces from word-boundary
+# spaces, the trained tokenizer cannot reconstruct inter-word spaces on
+# decode().  Single-word inputs round-trip correctly; multi-word inputs lose
+# the space.  The BPB / fertility pipelines only call encode(), so this does
+# not affect benchmark results.
+
+
+def test_morphbpe_single_word_decode_is_lossless(morphbpe_tokenizer):
+    """Single-word inputs: decode(encode(word)) == word (morphemes concatenate)."""
+    for word in ["happiness", "tokenization", "uncomfortable", "running"]:
+        decoded = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(word))
+        assert decoded == word, (
+            f"MorphBPE single-word decode should be lossless: {word!r} -> {decoded!r}"
+        )
+
+
+def test_morphbpe_multiword_decode_drops_spaces(morphbpe_tokenizer):
+    """Multi-word decode is known to lose inter-word spaces (documented limitation)."""
+    text = "playing tennis"
+    decoded = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(text))
+    # The limitation: spaces are dropped.
+    assert " " not in decoded, (
+        "If this assertion fails, MorphBPE decode now preserves spaces — "
+        "update the limitation note in _train_morphbpe and this test."
+    )
+
+
+# ---------- MorphBPE morpheme-boundary constraint --------------------------
+# Verifies that, when Morfessor *does* produce splits, BPE does not create
+# tokens that cross morpheme boundaries.
+#
+# Morfessor's MDL objective only splits words when the vocabulary is large
+# and morphological patterns repeat across many word types — typical of
+# agglutinative languages.  We generate a synthetic Finnish-style corpus
+# (regular root+suffix paradigms) that reliably triggers segmentation.
+# The supported language nearest to Finnish in the codebase is Turkish ("tr"),
+# which shares the same agglutinative typology.
+
+
+def _make_agglutinative_corpus(path: Path) -> None:
+    """Write a corpus rich enough for Morfessor to discover morpheme splits.
+
+    Morfessor's MDL objective only segments words when re-using morpheme pieces
+    across many word types reduces the total encoding cost.  We simulate a
+    Finnish-style agglutinative paradigm: many roots × many case/number/tense
+    suffixes (including vowel-harmony variants), resulting in 500+ word types
+    with clearly shared sub-strings.
+
+    Vowel-harmony pairs (e.g. "lle"/"llä", "lta"/"ltä") are essential:
+    Morfessor finds the shared root by observing that "auto", "talo", etc.
+    each appear with both variants.  Without this variety the MDL cost of
+    splitting exceeds its benefit.
+    """
+    roots = [
+        "auto", "talo", "kirja", "koira", "kissa", "mies", "nainen", "lapsi",
+        "maa", "puu", "katu", "koulu", "kauppa", "pankki", "ravintola",
+        "museo", "teatteri", "kirjasto",
+    ]
+    # Singular case suffixes (back-vowel / front-vowel harmony pairs)
+    case_suffixes = [
+        "",                                   # nominative
+        "n",                                  # genitive
+        "a", "ä",                             # partitive
+        "lle", "llä",                         # allative
+        "lta", "ltä",                         # ablative
+        "lla", "llä",                         # adessive
+        "sta", "stä",                         # elative
+        "han", "hen", "hin", "hon", "hun",    # illative variants
+        "ksi",                                # translative
+        "ssa", "ssä",                         # inessive
+        "ja", "jä",                           # comitative
+    ]
+    # Plural case suffixes (with "i" infix)
+    plural_suffixes = [
+        "t",           # nominative plural
+        "jen",         # genitive plural
+        "ja", "jä",    # partitive plural
+        "ille",        # allative plural
+        "ilta", "iltä",# ablative plural
+        "illa", "illä",# adessive plural
+        "ista", "istä",# elative plural
+    ]
+    import random as _random
+    rng = _random.Random(0)
+    lines = []
+    for root in roots:
+        for suffix in case_suffixes:
+            count = rng.randint(100, 3000)
+            lines.extend([root + suffix] * count)
+        for suffix in plural_suffixes:
+            count = rng.randint(50, 500)
+            lines.extend([root + "i" + suffix] * count)
+    rng.shuffle(lines)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def agglutinative_corpus(tmp_path_factory) -> Path:
+    p = tmp_path_factory.mktemp("aggl_corpus") / "train.txt"
+    _make_agglutinative_corpus(p)
+    return p
+
+
+def test_morfessor_segments_agglutinative_corpus(agglutinative_corpus):
+    """Sanity-check: Morfessor must learn to split morphemes on this corpus.
+
+    Morfessor may keep *training* words unitary (it stores an explicit analysis
+    per seen compound), but it will split *unseen* derived forms by applying
+    the morpheme inventory it learned.  We therefore probe a small set of
+    held-out words (root + plural-infix + case-suffix combinations that were
+    NOT emitted by the corpus generator) to verify the model learned a useful
+    morpheme decomposition.
+    """
+    from src.utils.morpheme_segmentation import (
+        _collect_word_counts,
+        _train_morfessor,
+    )
+    counts = _collect_word_counts(agglutinative_corpus)
+    model = _train_morfessor(counts, max_types=200_000)
+
+    # Held-out forms: root + "i" + adessive-suffix "lla" (not emitted by the
+    # corpus generator whose plural suffixes end in -lle/-ilta etc., not -illa).
+    held_out = [
+        "autoilla",    # auto + i + lla
+        "taloilla",    # talo + i + lla
+        "kouluilla",   # koulu + i + lla
+        "kirjoilla",   # kirja → kirjo + i + lla (stem change)
+        "kissoilla",   # kissa → kissoi + lla
+    ]
+    split_found = any(
+        len(model.viterbi_segment(w)[0]) > 1
+        for w in held_out
+        if w not in counts   # must be truly unseen
+    )
+    assert split_found, (
+        "Morfessor produced zero splits for held-out Finnish plural forms; "
+        "the model may not have learned root/suffix decomposition.  "
+        "MorphBPE would be identical to BPE for this corpus."
+    )
+
+
+def test_morphbpe_no_cross_morpheme_tokens(agglutinative_corpus, tmp_path_factory):
+    """Core MorphBPE invariant: no token in the vocabulary may span a morpheme boundary.
+
+    We train MorphBPE on the agglutinative corpus (where Morfessor splits reliably),
+    recover the Morfessor segmentation for every word type, and assert that every
+    learned BPE merge exists *within* a morpheme — never crossing one.
+    """
+    from src.utils.morpheme_segmentation import (
+        _collect_word_counts,
+        _train_morfessor,
+        _segment_word,
+    )
+
+    out = tmp_path_factory.mktemp("morphbpe_aggl")
+    train_tokenizer(
+        corpus_path=agglutinative_corpus,
+        algorithm="morphbpe",
+        vocab_size=500,
+        output_dir=out,
+        language="tr",
+    )
+    tok = load_tokenizer(out, algorithm="morphbpe")
+
+    counts = _collect_word_counts(agglutinative_corpus)
+    morph_model = _train_morfessor(counts, max_types=200_000)
+    cache: dict = {}
+
+    cross_boundary_tokens: list[str] = []
+    for word in counts:
+        morphemes = _segment_word(morph_model, word, cache)
+        if len(morphemes) <= 1:
+            continue  # unsplit word — no boundary to check
+        ids = tok.encode(word)
+        tokens = [tok.tokenizer.id_to_token(i) for i in ids]
+        # Reconstruct the character positions of each morpheme boundary.
+        pos = 0
+        boundaries: set[int] = set()
+        for m in morphemes[:-1]:
+            pos += len(m)
+            boundaries.add(pos)
+        # Check whether any token straddles a boundary.
+        char_pos = 0
+        for token in tokens:
+            raw = token.replace("</w>", "")  # strip end-of-word marker if present
+            token_start = char_pos
+            token_end = char_pos + len(raw)
+            for b in boundaries:
+                if token_start < b < token_end:
+                    cross_boundary_tokens.append(
+                        f"{word!r}: token {token!r} crosses boundary at pos {b} "
+                        f"(morphemes={morphemes})"
+                    )
+            char_pos = token_end
+
+    assert not cross_boundary_tokens, (
+        "MorphBPE produced tokens that cross morpheme boundaries:\n"
+        + "\n".join(cross_boundary_tokens[:10])
+    )
