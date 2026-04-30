@@ -368,7 +368,7 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
     # seed a fresh BPE that has no pre-tokenizer for stage 2.
     s1 = _json.loads(tok1.to_str())
     s1_vocab = s1["model"]["vocab"]                                    # dict[str, int]
-    s1_merges = [tuple(m.split(" ", 1)) for m in s1["model"]["merges"]]  # list[(str,str)]
+    s1_merges = [tuple(m) for m in s1["model"]["merges"]]  # list[(str, str)]
 
     # Stage 2: cross-word extension.
     tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges, unk_token="<unk>"))
