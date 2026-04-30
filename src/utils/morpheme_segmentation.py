@@ -12,24 +12,26 @@ custom trainer.
 
 Per-language morpheme segmenters
 --------------------------------
-- en (English):  MorphyNet (Batsuren et al. 2021) inflectional segmentations
-                 — a ~650k-entry gold lookup built from Wiktionary. Words not
-                 in the table are kept unsplit. The file is downloaded once to
-                 ``~/.cache/morphynet/`` (or a caller-supplied directory) and
-                 reused on subsequent runs. This matches the paper's use of
-                 gold SIGMORPHON/Wiktionary segmentations for English rather
-                 than unsupervised Morfessor, which rarely splits English words.
-- hu (Hungarian):Morfessor 2.0 trained unsupervisedly on the corpus.
-                 (Morfessor was originally designed for Finnish, another
-                 Uralic agglutinative language; it generalises well to
-                 Hungarian given its similarly rich suffixal morphology.)
+Both supported languages use MorphyNet (Batsuren et al. 2021) gold
+inflectional segmentations derived from Wiktionary (CC-BY-SA 3.0). This
+matches the paper (Asgari et al. 2025), which sources segmentations for
+English, Hungarian, and Russian from the SIGMORPHON 2022 Shared Task on
+Morpheme Segmentation (Batsuren et al. 2022) — which is itself built on
+MorphyNet.
+
+- en (English):  eng/eng.inflectional.v1.tsv          (~650k entries)
+- hu (Hungarian):hun/hu.inflectional.segmentation.v1.tsv (~1M entries)
+
+Words not in the lookup are kept unsplit (OOV fallback).
+
 - zh (Mandarin): not supported. Mandarin is super-analytic — its words
                  don't decompose into the inflectional/derivational
                  morphemes MorphBPE was designed to exploit — so we raise
                  a clear error rather than silently degrading to BPE.
 
 Adding a language amounts to adding it to ``SUPPORTED_LANGUAGES`` and
-wiring up a segmenter in ``segment_corpus``.
+``_MORPHYNET_FILES``, then verifying that the MorphyNet TSV exists at the
+expected path in the repository.
 """
 
 from __future__ import annotations
@@ -42,19 +44,20 @@ from typing import Callable
 
 SUPPORTED_LANGUAGES: tuple[str, ...] = ("en", "hu")
 
-# MorphyNet English inflectional data (Batsuren et al. 2021, CC-BY-SA 3.0).
-MORPHYNET_URL = (
+# MorphyNet file registry: our 2-letter code → (subdir, filename) within the repo.
+# File format (TSV, 4 columns): lemma TAB inflected TAB features TAB morphemes
+# where morphemes are pipe-separated and "-" means irregular (no segmentation).
+_MORPHYNET_FILES: dict[str, tuple[str, str]] = {
+    "en": ("eng", "eng.inflectional.v1.tsv"),
+    "hu": ("hun", "hu.inflectional.segmentation.v1.tsv"),
+}
+MORPHYNET_BASE_URL = (
     "https://raw.githubusercontent.com/kbatsuren/MorphyNet/master/"
-    "eng/eng.inflectional.v1.tsv"
 )
 MORPHYNET_DEFAULT_CACHE: Path = Path.home() / ".cache" / "morphynet"
 
-# Cap how many word types we feed to Morfessor. Morfessor's MDL objective
-# scales with vocabulary, and on a 500MB corpus the type count is ~1-3M;
-# 200k covers >99% of token mass for Hungarian.
+# Kept for optional use and tests that exercise Morfessor internals directly.
 DEFAULT_MAX_TYPES = 200_000
-
-# Cap on lines read for word-frequency collection. None = read whole file.
 DEFAULT_MAX_LINES: int | None = None
 
 
@@ -63,24 +66,25 @@ def is_supported(language: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# English: MorphyNet lookup
+# MorphyNet lookup (production path for all supported languages)
 # ---------------------------------------------------------------------------
 
 
-def _load_morphynet_english(cache_dir: Path) -> dict[str, list[str]]:
-    """Return word → [morpheme, ...] from MorphyNet English inflectional TSV.
+def _load_morphynet(language: str, cache_dir: Path) -> dict[str, list[str]]:
+    """Return word → [morpheme, ...] from the MorphyNet inflectional TSV.
 
-    Downloads the ~20 MB file once to cache_dir and reuses it on subsequent
-    calls. Words with irregular segmentations (column 4 == "-") are skipped;
-    callers fall back to [word] for those.
+    Downloads the file once to cache_dir and reuses it on subsequent calls.
+    Words with irregular segmentations (column 4 == "-") are skipped; callers
+    fall back to [word] for those.
     """
+    subdir, filename = _MORPHYNET_FILES[language]
+    url = f"{MORPHYNET_BASE_URL}{subdir}/{filename}"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    tsv_path = cache_dir / "eng.inflectional.v1.tsv"
+    tsv_path = cache_dir / filename
     if not tsv_path.exists():
         import urllib.request
 
-        urllib.request.urlretrieve(MORPHYNET_URL, tsv_path)
-
+        urllib.request.urlretrieve(url, tsv_path)
     lookup: dict[str, list[str]] = {}
     with open(tsv_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -95,7 +99,7 @@ def _load_morphynet_english(cache_dir: Path) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Hungarian: Morfessor
+# Morfessor utilities — kept for tests that exercise internals directly
 # ---------------------------------------------------------------------------
 
 
@@ -128,8 +132,7 @@ def _train_morfessor(word_counts: Counter[str], max_types: int):
 
 # A morpheme is a non-empty string. We rejoin morphemes with a single ASCII
 # space so the downstream Whitespace pre-tokenizer treats each as its own
-# unit. Empty morphemes (rare; Morfessor occasionally returns them on edge
-# cases) are dropped to avoid emitting double spaces.
+# unit. Empty morphemes are dropped to avoid emitting double spaces.
 _PUNCT_RE = re.compile(r"^\W+$", flags=re.UNICODE)
 
 
@@ -162,9 +165,10 @@ def segment_corpus(
     corpus_path: Path,
     output_path: Path,
     language: str,
+    morphynet_cache_dir: Path | None = None,
+    # kept for API compatibility; unused now that MorphyNet replaces Morfessor
     max_types: int = DEFAULT_MAX_TYPES,
     max_lines: int | None = DEFAULT_MAX_LINES,
-    morphynet_cache_dir: Path | None = None,
 ) -> None:
     """Write a morpheme-segmented copy of corpus_path to output_path.
 
@@ -172,8 +176,8 @@ def segment_corpus(
     by single spaces. Original line structure is preserved.
 
     Args:
-        morphynet_cache_dir: Directory to cache the MorphyNet TSV (English
-            only). Defaults to ``~/.cache/morphynet``. Pass a tmp directory
+        morphynet_cache_dir: Directory to cache downloaded MorphyNet TSV
+            files. Defaults to ``~/.cache/morphynet``. Pass a tmp directory
             in tests to avoid network access.
     """
     if not is_supported(language):
@@ -181,27 +185,16 @@ def segment_corpus(
             f"MorphBPE is not configured for language {language!r}. "
             f"Supported: {SUPPORTED_LANGUAGES}. Mandarin (zh) is excluded "
             "because it lacks the inflectional morphology MorphBPE relies "
-            "on. To add another language, register a segmenter in "
-            "src/utils/morpheme_segmentation.py."
+            "on. To add another language, add it to SUPPORTED_LANGUAGES and "
+            "_MORPHYNET_FILES in src/utils/morpheme_segmentation.py."
         )
 
-    if language == "en":
-        cache_dir = morphynet_cache_dir if morphynet_cache_dir is not None else MORPHYNET_DEFAULT_CACHE
-        lookup = _load_morphynet_english(cache_dir)
-        segmenter_fn: Callable[[str], list[str]] = lambda w: lookup.get(w, [w])
-    else:
-        counts = _collect_word_counts(corpus_path, max_lines=max_lines)
-        if not counts:
-            raise ValueError(
-                f"Corpus at {corpus_path} contains no whitespace-delimited tokens"
-            )
-        model = _train_morfessor(counts, max_types=max_types)
-        segmenter_fn = lambda w: list(model.viterbi_segment(w)[0])
+    cache_dir = morphynet_cache_dir if morphynet_cache_dir is not None else MORPHYNET_DEFAULT_CACHE
+    lookup = _load_morphynet(language, cache_dir)
+    segmenter_fn: Callable[[str], list[str]] = lambda w: lookup.get(w, [w])
 
     cache: dict[str, list[str]] = {}
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    n_split = 0
-    n_total = 0
     with (
         open(corpus_path, "r", encoding="utf-8") as fin,
         open(output_path, "w", encoding="utf-8") as fout,
@@ -213,20 +206,6 @@ def segment_corpus(
                 continue
             pieces: list[str] = []
             for w in words:
-                morphemes = _segment_word(segmenter_fn, w, cache)
-                pieces.extend(morphemes)
-                n_total += 1
-                if len(morphemes) > 1:
-                    n_split += 1
+                pieces.extend(_segment_word(segmenter_fn, w, cache))
             fout.write(" ".join(pieces))
             fout.write("\n")
-
-    if n_total > 0 and n_split == 0 and language != "en":
-        warnings.warn(
-            f"Morfessor produced no morpheme splits for language {language!r} "
-            f"({n_total} word tokens checked). MorphBPE will be equivalent to "
-            f"plain BPE for this corpus. Morfessor works best on agglutinative "
-            f"languages (Hungarian, Finnish) with large, morphologically diverse "
-            f"corpora.",
-            stacklevel=2,
-        )

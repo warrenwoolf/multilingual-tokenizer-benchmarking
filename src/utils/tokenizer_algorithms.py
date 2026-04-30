@@ -321,9 +321,16 @@ def _train_morphbpe(
     BPE never counts or merges a pair across a morpheme boundary during
     training, which is equivalent to Algorithm 1 for the encode path.
 
-    Inference: because no cross-morpheme merge is ever added to the merge
-    table, BPE applied to an unsegmented word at inference time naturally
-    stops at morpheme boundaries — the same guarantee as the paper.
+    Training guarantee: no cross-morpheme merge is ever *learned* because
+    the Whitespace pre-tokenizer cannot count pairs across the inserted
+    spaces.  This is equivalent to Algorithm 1 for the training path.
+
+    Inference caveat: at inference time words are presented without spaces,
+    so BPE may cross morpheme boundaries by composing within-morpheme merges
+    (e.g. 'run'+'n'+'ing' merges produce 'ning' which straddles the n|ing
+    boundary).  The paper's inline-filter approach avoids this by filtering
+    merge candidates during training rather than rewriting the corpus; our
+    preprocessing approximation is weaker on the inference side.
 
     Decode limitation: the segmented training corpus does not distinguish
     original word-boundary spaces from morpheme-boundary spaces, so the
