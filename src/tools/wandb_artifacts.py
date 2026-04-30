@@ -149,17 +149,23 @@ def pull_tokenizer_artifacts(
             f"Check that the project exists and WANDB_API_KEY is set. Original error: {exc}"
         ) from exc
 
+    import re
+
     pulled = 0
     skipped = 0
     for art in artifacts:
-        dest = artifact_dir / art.name
+        # W&B artifact `name` often includes a version suffix like `:v0`.
+        # Our local artifact dirs are named `{lang}_{algo}_v{size}` so strip
+        # any trailing ":v<digits>" before creating the directory.
+        clean_name = re.sub(r":v\d+$", "", art.name)
+        dest = artifact_dir / clean_name
         if dest.exists() and (dest / "tokenizer.json").exists():
-            print(f"  skip (already present): {art.name}")
+            print(f"  skip (already present): {clean_name}")
             skipped += 1
             continue
         dest.mkdir(parents=True, exist_ok=True)
         art.download(root=str(dest))
-        print(f"  pulled: {art.name}")
+        print(f"  pulled: {art.name} -> {clean_name}")
         pulled += 1
 
     print(f"[wandb] Pull complete — {pulled} downloaded, {skipped} already present.")
