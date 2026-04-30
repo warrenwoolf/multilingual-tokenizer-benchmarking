@@ -645,11 +645,16 @@ def evaluate_perplexity_on_sentences(
     return _score_corpus(model, corpus, cfg, device, amp_dtype)
 
 
+_FLORES_CDN = "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
+
+
 def load_flores_devtest(language: str) -> list[str]:
     """Return FLORES-200 devtest sentences for ``language`` (en/zh/tr/ru/hi).
 
-    Uses the canonical ``facebook/flores`` dataset on the Hub. Network call;
-    cached by the ``datasets`` library after the first hit.
+    Downloads the official FLORES-200 archive from Meta's CDN directly,
+    bypassing the HuggingFace datasets loading script (which is broken in
+    datasets >= 3.0). The archive is cached in the HF datasets cache dir
+    (or a system temp dir) so the download only happens once.
     """
     if language not in FLORES_CONFIGS:
         raise ValueError(
@@ -657,11 +662,32 @@ def load_flores_devtest(language: str) -> list[str]:
             f"Known: {sorted(FLORES_CONFIGS)}"
         )
     config = FLORES_CONFIGS[language]
-    from datasets import load_dataset
 
-    ds = load_dataset("facebook/flores", config, split="devtest")
-    # FLORES rows have a 'sentence' field (canonical translation in `config`).
-    return [row["sentence"] for row in ds]
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    # Resolve cache directory: prefer HF datasets cache so it coexists with
+    # other cached datasets; fall back to a persistent temp dir.
+    try:
+        from datasets import config as _ds_cfg
+        cache_root = Path(_ds_cfg.HF_DATASETS_CACHE)
+    except Exception:
+        cache_root = Path(tempfile.gettempdir())
+
+    flores_root = cache_root / "flores200_dataset"
+    data_file = flores_root / "devtest" / f"{config}.devtest"
+
+    if not data_file.exists():
+        archive = cache_root / "flores200_dataset.tar.gz"
+        if not archive.exists():
+            cache_root.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(_FLORES_CDN, archive)
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(cache_root)
+
+    lines = data_file.read_text(encoding="utf-8").splitlines()
+    return [s.strip() for s in lines if s.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -758,15 +784,16 @@ def train_and_evaluate(
         if eval_flores and language is not None:
             try:
                 flores_sents = load_flores_devtest(language)
-            except Exception as exc:
-                log_fn(f"  FLORES eval skipped: {exc}")
-            else:
                 flores_metrics = evaluate_perplexity_on_sentences(
                     model, tokenizer, flores_sents, cfg, device, amp_dtype,
                     label=f"flores/{FLORES_CONFIGS[language]}", log_fn=log_fn,
                 )
                 for k, v in flores_metrics.items():
                     out[f"flores_{k}"] = v
+            except Exception as exc:
+                import traceback as _tb
+                log_fn(f"  FLORES eval skipped for {language!r}: {exc}")
+                log_fn(_tb.format_exc())
 
         # Training-corpus stats (rows + bytes/row, the sanity-check indicator).
         out["train_tokens_actual"] = train_corpus.n_tokens
