@@ -327,7 +327,11 @@ def _train_bpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
     tok = Tokenizer(BPE(unk_token="<unk>"))
     tok.pre_tokenizer = ByteLevelPre(add_prefix_space=False)
     tok.decoder = decoders.ByteLevel()
-    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=DEFAULT_SPECIAL_TOKENS,
+        initial_alphabet=ByteLevelPre.alphabet(),
+    )
     tok.train(files=[str(corpus_path)], trainer=trainer)
     HFAdapter(tok, algorithm="bpe").save(output_dir)
 
