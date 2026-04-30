@@ -339,88 +339,46 @@ def _train_morphbpe(
 
 
 def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> None:
-    """Call train_tokenizer.py from the PythonNut/superbpe repo directly.
+    """Native two-stage SuperBPE (Nut et al. 2025) via HF tokenizers.
 
-    Requires SUPERBPE_REPO env var pointing to a cloned superbpe repo, Python
-    3.12, and the alisawuffles/tokenizers-superbpe fork installed
-    (handled by `make install-superbpe`).
+    Stage 1 — standard BPE with Whitespace pre-tokenizer (90% of vocab budget).
+              Merges are constrained to word boundaries.
+    Stage 2 — reseed from stage-1 vocab+merges, then continue training without
+              a pre-tokenizer so the BPE trainer sees spaces as ordinary
+              characters and can discover merges that cross word boundaries.
 
-    The two-stage workflow mirrors extend_tokenizer.sh:
-      Stage 1 — train standard BPE on 90% of the vocab budget with a corpus dir.
-      Stage 2 — extend with cross-word merges (remaining 10%) by seeding the
-                stage-2 dir with stage-1 merges+metadata and re-running without
-                --corpus_dir so train_tokenizer reads the paths from meta.json.
+    No external repo, Rust toolchain, or patched tokenizers fork is needed.
     """
-    import shutil
-    import sys as _sys
+    import json as _json
+    from tokenizers import Tokenizer, decoders
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.trainers import BpeTrainer
 
-    repo = os.environ.get("SUPERBPE_REPO")
-    if not repo:
-        raise RuntimeError(
-            "SuperBPE training requires SUPERBPE_REPO env var pointing to the "
-            "cloned PythonNut/superbpe repo. Run `make install-superbpe` first."
-        )
-    repo_path = Path(repo).resolve()
-    if not (repo_path / "train_tokenizer.py").exists():
-        raise RuntimeError(
-            f"SUPERBPE_REPO={repo_path} does not look like a superbpe clone "
-            "(missing train_tokenizer.py)."
-        )
-
-    # Resolve all paths up front so they stay valid when cwd=repo_path.
-    corpus_path = corpus_path.resolve()
     stage1_size = int(vocab_size * 0.9)
-    work_dir = output_dir.resolve() / "_superbpe_work"
-    stage1_dir = work_dir / "stage1"
-    stage2_dir = work_dir / "stage2"
 
-    # train_tokenizer.py expects --corpus_dir (a directory), not a single file.
-    # Expose the corpus file inside a small directory via a symlink.
-    corpus_dir = work_dir / "corpus"
-    corpus_dir.mkdir(parents=True, exist_ok=True)
-    corpus_link = corpus_dir / corpus_path.name
-    if not corpus_link.exists():
-        corpus_link.symlink_to(corpus_path)
+    # Stage 1: word-boundary BPE.
+    tok1 = Tokenizer(BPE(unk_token="<unk>"))
+    tok1.pre_tokenizer = Whitespace()
+    tok1.decoder = decoders.BPEDecoder()
+    trainer1 = BpeTrainer(vocab_size=stage1_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
+    tok1.train(files=[str(corpus_path)], trainer=trainer1)
 
-    # Stage 1: word-boundary-respecting BPE.
-    stage1_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            _sys.executable, "-m", "train_tokenizer",
-            "--output_dir", str(stage1_dir),
-            "--corpus_dir", str(corpus_dir),
-            "--vocab_size", str(stage1_size),
-        ],
-        check=True,
-        cwd=str(repo_path),
-    )
+    # Pull the stage-1 vocab and merges out of the serialised model so we can
+    # seed a fresh BPE that has no pre-tokenizer for stage 2.
+    s1 = _json.loads(tok1.to_str())
+    s1_vocab = s1["model"]["vocab"]                                    # dict[str, int]
+    s1_merges = [tuple(m.split(" ", 1)) for m in s1["model"]["merges"]]  # list[(str,str)]
 
-    # Stage 2: cross-word extension (the SuperBPE step).
-    # Seed stage2 with stage1's merges and meta.json so train_tokenizer extends
-    # rather than retrains. No --corpus_dir needed; it reads paths from meta.json.
-    stage2_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy(stage1_dir / "merges.txt", stage2_dir / "merges.txt")
-    shutil.copy(stage1_dir / "meta.json", stage2_dir / "meta.json")
-    subprocess.run(
-        [
-            _sys.executable, "-m", "train_tokenizer",
-            "--output_dir", str(stage2_dir),
-            "--vocab_size", str(vocab_size),
-        ],
-        check=True,
-        cwd=str(repo_path),
-    )
+    # Stage 2: cross-word extension.
+    tok2 = Tokenizer(BPE(vocab=s1_vocab, merges=s1_merges, unk_token="<unk>"))
+    tok2.decoder = decoders.BPEDecoder()
+    # No pre_tokenizer → spaces are treated as ordinary characters, allowing
+    # new merges to span word boundaries.
+    trainer2 = BpeTrainer(vocab_size=vocab_size, special_tokens=DEFAULT_SPECIAL_TOKENS)
+    tok2.train(files=[str(corpus_path)], trainer=trainer2)
 
-    final = stage2_dir / "tokenizer.json"
-    if not final.exists():
-        raise RuntimeError(f"SuperBPE finished but no tokenizer.json at {final}")
-    (output_dir / _TOKENIZER_FILENAME).write_bytes(final.read_bytes())
-    (output_dir / _CONFIG_FILENAME).write_text(
-        json.dumps(
-            {"algorithm": "superbpe", "special_tokens": DEFAULT_SPECIAL_TOKENS, "is_byte_level": False}
-        ),
-        encoding="utf-8",
-    )
+    HFAdapter(tok2, algorithm="superbpe").save(output_dir)
 
 
 # ---------------------------------------------------------------------------

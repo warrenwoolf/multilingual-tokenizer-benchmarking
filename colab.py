@@ -22,20 +22,10 @@ BRANCH = "main" # Change this if using an unmerged branch
 REPO_DIR = "multilingual-tokenizer-benchmarking"
 
 LANGUAGES = "en,zh,tr"
-ALGORITHMS = "bpe,tiktoken,morphbpe,wordpiece,unigram,byt5"
+ALGORITHMS = "bpe,superbpe,tiktoken,morphbpe,wordpiece,unigram,byt5"
 VOCAB_SIZES = "8000,16000,32000"                    # 64000 added if budget permits
 MAX_TRAIN_ROWS = 100_000                            # rows per language for a quick run
 MAX_EVAL_ROWS = 5_000
-
-# SuperBPE (Nut et al. 2025) — two-stage BPE that merges across word boundaries.
-# Requirements before flipping this on:
-#   1. Runtime must be Python 3.12  →  Runtime ▸ Change runtime type ▸ Python 3.12
-#   2. Rust/cargo is installed automatically below (takes ~1 min on a cold Colab).
-#   3. The patched alisawuffles/tokenizers-superbpe fork is compiled from source
-#      (~5-10 min on a free-tier GPU runtime; ~15 min on CPU-only).
-# Leave False on Python 3.10/3.11 runtimes — the Rust extension won't compile.
-RUN_SUPERBPE = False
-SUPERBPE_DIR = "third_party/superbpe"   # cloned here inside REPO_DIR
 
 # Downstream LLM evaluation (heavy; needs a GPU runtime + extra deps).
 # Flip ON only on a GPU runtime; defaults are tuned for a smoke run.
@@ -68,38 +58,6 @@ except Exception:
 if RUN_LLM_EVAL:
     !pip install -q -e ".[llm]" wandb
 
-# 3b. SuperBPE extra setup — skipped unless RUN_SUPERBPE = True
-if RUN_SUPERBPE:
-    import shutil
-    import sys as _sys
-    if _sys.version_info < (3, 12):
-        raise RuntimeError(
-            f"SuperBPE requires Python 3.12+.  Current: {_sys.version}\n"
-            "Go to Runtime ▸ Change runtime type ▸ Python 3.12 and re-run."
-        )
-    # Install Rust if cargo is not on PATH (needed to compile tokenizers-superbpe)
-    if not shutil.which("cargo"):
-        print("Installing Rust toolchain (one-time, ~1 min)…")
-        !curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-        os.environ["PATH"] = os.path.expanduser("~/.cargo/bin") + ":" + os.environ.get("PATH", "")
-    # Clone PythonNut/superbpe with its submodules
-    if not os.path.isdir(SUPERBPE_DIR):
-        print(f"Cloning PythonNut/superbpe → {SUPERBPE_DIR}…")
-        !git clone --recurse-submodules https://github.com/PythonNut/superbpe.git {SUPERBPE_DIR}
-    # Install superbpe's Python requirements.  Must run from SUPERBPE_DIR because
-    # requirements.txt contains "-e tokenizers_superbpe/bindings/python/" — a
-    # relative editable path that only resolves from inside the repo.
-    !cd {SUPERBPE_DIR} && pip install -q -r requirements.txt
-    # Install the patched tokenizers fork (compiles Rust extension, ~5-15 min).
-    # This replaces the standard `tokenizers` with an older 0.20.x-based fork.
-    print("Building alisawuffles/tokenizers-superbpe (compiles Rust — grab a coffee)…")
-    !pip install -q "git+https://github.com/alisawuffles/tokenizers-superbpe.git@main#subdirectory=bindings/python"
-    # The fork pins tokenizers 0.20.x, which is incompatible with transformers 5.x.
-    # Downgrade transformers to a version that accepts tokenizers>=0.20.
-    !pip install -q "transformers>=4.40,<5.0"
-    os.environ["SUPERBPE_REPO"] = os.path.abspath(SUPERBPE_DIR)
-    print(f"SuperBPE ready.  SUPERBPE_REPO={os.environ['SUPERBPE_REPO']}")
-
 # 2b. Load the W&B API key from Colab Secrets if available, into tokens/wandb.token.
 #     Add a secret named WANDB_API_KEY in the Colab "key" sidebar before running.
 if RUN_LLM_EVAL and WANDB_PROJECT:
@@ -124,10 +82,6 @@ if RUN_LLM_EVAL and WANDB_PROJECT:
 # 4. Override the per-script config via env-var-friendly Python overrides.
 #    Each script is config-only at the top, so a tiny shim keeps the run
 #    parameterized without editing the file in the repo.
-_algorithms = ALGORITHMS.split(',')
-if RUN_SUPERBPE and 'superbpe' not in _algorithms:
-    _algorithms.append('superbpe')
-
 shim = f"""
 import sys
 sys.path.insert(0, '.')
@@ -145,7 +99,7 @@ download_all_languages(
 from src.tools.create_tokenizer import generate_all_tokenizers
 generate_all_tokenizers(
     languages={LANGUAGES.split(',')!r},
-    algorithms={_algorithms!r},
+    algorithms={ALGORITHMS.split(',')!r},
     vocab_sizes=[int(v) for v in {VOCAB_SIZES.split(',')!r}],
     data_dir='data',
     artifact_dir='artifacts',
