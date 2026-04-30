@@ -66,9 +66,11 @@ except Exception:
     pass  # not running in Colab or secret not set
 
 # 3. Install dependencies (editable so any tweaks take effect immediately)
-!pip install -q -e .
+print("[colab] Installing main Python dependencies...", flush=True)
+!pip install -e .
 if RUN_LLM_EVAL:
-    !pip install -q -e ".[llm]" wandb
+    print("[colab] Installing LLM extras...", flush=True)
+    !pip install -e ".[llm]" wandb
 
 # 3b. Install the official SuperBPE repo if requested. This pulls the patched
 # tokenizers submodule, builds its Rust-backed Python extension, and keeps it in
@@ -76,6 +78,7 @@ if RUN_LLM_EVAL:
 if "superbpe" in ALGORITHMS.split(","):
     !chmod +x scripts/install_superbpe.sh
     os.environ["PYTHON"] = sys.executable
+    print("[colab] Installing official SuperBPE repo...", flush=True)
     subprocess.run(["bash", "scripts/install_superbpe.sh"], check=True)
     superbpe_repo_abs = os.path.abspath(SUPERBPE_REPO)
     if not os.path.isdir(superbpe_repo_abs):
