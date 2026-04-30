@@ -67,11 +67,72 @@ preparation pass.
 
 ## Metrics
 
+### Intrinsic (cheap; no model training)
+
 Implemented in `src/utils/evaluation_metrics.py`:
 
 - **Fertility** — average tokens per whitespace-delimited word. Lower = more efficient.
 - **Vocabulary coverage** — fraction of eval-set word types that appear as a single token in the vocab.
 - **% continued words** — fraction of eval-set words that are split into more than one token.
+
+### Downstream LLM (expensive; predictive)
+
+Implemented in `src/utils/llm_training.py`. Each tokenizer trains a fresh
+**monolingual** ~50M-param GPT on its language's corpus, then we score two
+held-out eval sets:
+
+- **Test set** (in-domain) — `data/{lang}/eval.txt` from FineWeb / FineWeb 2.
+- **FLORES-200 devtest** (out-of-distribution) — `facebook/flores`,
+  professionally translated, the standard cross-lingual generalisation probe.
+
+For each, we report:
+
+- **Bits-per-byte (BPB)** — held-out cross-entropy normalised by raw UTF-8
+  bytes of the eval text. **This is the cross-tokenizer-comparable metric.**
+  Lower = the tokenizer enables a better LM at fixed compute.
+- **Perplexity** — kept for diagnostics; *not* comparable across tokenizers
+  because PPL depends on vocab/segmentation.
+
+Architecture: pre-LN GPT decoder, d_model=512, 8 layers, 8 heads, d_ff=2048,
+ctx=512, weight-tied head. Param count varies with vocab (the embedding
+table dominates):
+
+| vocab | params |
+|------:|-------:|
+|  8 k  | ~30 M  |
+| 32 k  | ~42 M  |
+| 64 k  | ~58 M  |
+
+**Wall-clock** (1B-token Chinchilla-optimal run, A100 40GB at ~250K tok/s
+bf16): ~65 min per LM. Full default sweep of 3 langs × 3 algos × 4 vocab
+sizes ≈ 36 LMs ≈ ~40 A100-hours. Shrink the vocab sweep before kicking off.
+
+**Compute fairness caveat.** We fix the *training-token budget* across all
+tokenizers (default 1B tokens, ~Chinchilla-optimal for 50M params). This
+is intentionally imperfect: a high-fertility tokenizer sees less *content*
+for the same token count, and a larger-vocab tokenizer has a bigger
+embedding so more FLOPs/token. Fixing wall-clock or training-FLOPs would
+be more rigorous; for v1 we trade rigor for reproducibility and document
+the caveat. See `llm_training.py` docstring.
+
+**Logging.** Every (lang, algo, vocab) run optionally streams loss + LR +
+final eval metrics to Weights & Biases. Set `WANDB_PROJECT` (env var or in
+`train_llms.py`); the API key is loaded from `WANDB_API_KEY` env var or
+`tokens/wandb.token` (gitignored). In Colab, `colab.py` reads the
+`WANDB_API_KEY` Colab Secret and writes it to the token slot for you.
+
+**W&B Artifacts.** Each run also uploads:
+- the tokenizer artifact dir (type=`tokenizer`, ~MB) at run start
+- the trained model state_dict (type=`model`, ~200 MB at 50M params) at end
+Toggle via `wandb_log_tokenizer_artifact` / `wandb_log_model_artifact` on
+`LLMConfig`. Pull a previously-trained model with
+`wandb.use_artifact("model:vN").download()`.
+
+**Row-based data accounting.** The data pipeline budgets in document rows,
+not bytes. `llm_results.csv` records `train_rows`, `train_bytes_per_row`,
+`train_tokens_per_row`, and the matching `*_eval_*` columns — eyeball
+`bytes_per_row` to confirm the per-language slice matches expectations
+(non-Latin scripts produce ~3× the byte count per character).
 
 ## Quick start
 
@@ -84,6 +145,12 @@ python download_data.py # streams FineWeb(-2) for the configured languages
 python generate_tokenizers.py
 python evaluate_tokenizers.py
 cat results.csv
+
+# Optional: downstream perplexity / BPB by training a small LM per tokenizer.
+# Heavy (needs torch + a GPU for the default 50M-token budget); opt-in.
+make install-llm
+python train_llms.py
+cat llm_results.csv
 ```
 
 ### Colab
@@ -115,8 +182,9 @@ run.
 .
 ├── colab.py                       paste-into-Colab one-cell quickstart
 ├── download_data.py               top-level: config for streaming FineWeb(-2)
-├── generate_tokenizers.py         top-level: config for training
-├── evaluate_tokenizers.py         top-level: config for evaluating + CSV out
+├── generate_tokenizers.py         top-level: config for training tokenizers
+├── evaluate_tokenizers.py         top-level: intrinsic metrics + CSV
+├── train_llms.py                  top-level: downstream LLM PPL/BPB + CSV
 ├── pyproject.toml
 ├── Makefile
 ├── REFERENCES.md                  paper + implementation citations
@@ -126,10 +194,12 @@ run.
 │   ├── tools/
 │   │   ├── download_data.py         iteration over LANGUAGES
 │   │   ├── create_tokenizer.py      single-shot + full sweep training
-│   │   └── evaluate_tokenizer.py    single-shot + full sweep + CSV
+│   │   ├── evaluate_tokenizer.py    single-shot + full sweep + CSV
+│   │   └── train_llm.py             sweep: train small LM per artifact + CSV
 │   └── utils/
 │       ├── tokenizer_algorithms.py  7 adapters
-│       └── evaluation_metrics.py    fertility, coverage, split rate
+│       ├── evaluation_metrics.py    fertility, coverage, split rate
+│       └── llm_training.py          ~50M GPT, train loop, perplexity + BPB
 ├── tests/
 │   ├── conftest.py                  tiny multilingual corpus fixture
 │   ├── test_tokenizer_contract.py   contract tests against every adapter

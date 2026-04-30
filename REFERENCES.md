@@ -59,3 +59,15 @@ The following algorithms were scoped out of v1. Keeping citations here for the p
 - **English:** [HuggingFaceFW/fineweb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) — fastText-filtered at English score ≥ 0.65.
 - **Non-English (RU/HI/TR):** [HuggingFaceFW/fineweb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2) — multilingual successor, built from the non-English residual of FineWeb. Uses FLORES `{iso639-3}_{script}` config names.
 - **FineWeb 2 processing pipeline:** [huggingface/fineweb-2](https://github.com/huggingface/fineweb-2)
+
+### FLORES-200
+- **Paper:** NLLB Team et al. (2022). *No Language Left Behind: Scaling Human-Centered Machine Translation*. [arXiv:2207.04672](https://arxiv.org/abs/2207.04672)
+- **Dataset:** [facebook/flores](https://huggingface.co/datasets/facebook/flores) — 200-language professionally-translated parallel corpus. We use the `devtest` split as an out-of-distribution generalisation probe for downstream LM evaluation. Configs are `{iso639-3}_{script}` (e.g. `eng_Latn`, `zho_Hans`, `tur_Latn`).
+
+## Compute / training
+
+### Chinchilla scaling
+- **Paper:** Hoffmann, Borgeaud, Mensch et al. (2022). *Training Compute-Optimal Large Language Models*. [arXiv:2203.15556](https://arxiv.org/abs/2203.15556) — ~20 tokens per parameter is the compute-optimal training budget. Used here to set the default 1B-token budget for our 50M-param LMs.
+
+### Bits-per-byte
+- **Background:** Used as a tokenizer-invariant LM metric in *The Pile* (Gao et al., 2020, [arXiv:2101.00027](https://arxiv.org/abs/2101.00027)) and most subsequent multilingual LM evaluations.

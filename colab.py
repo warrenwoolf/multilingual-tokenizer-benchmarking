@@ -26,6 +26,12 @@ ALGORITHMS = "bpe,tiktoken,morphbpe,wordpiece,unigram,byt5"  # SuperBPE needs ex
 VOCAB_SIZES = "8000,16000,32000"                    # 64000 added if budget permits
 MAX_TRAIN_ROWS = 100_000                            # rows per language for a quick run
 MAX_EVAL_ROWS = 5_000
+
+# Downstream LLM evaluation (heavy; needs a GPU runtime + extra deps).
+# Flip ON only on a GPU runtime; defaults are tuned for a smoke run.
+RUN_LLM_EVAL = False
+LLM_TRAIN_TOKENS = 50_000_000      # 1B for the real Chinchilla-optimal sweep
+WANDB_PROJECT = "tokenizer-bench"  # set to None to disable W&B logging
 # ===========================================================================
 
 import os
@@ -49,6 +55,29 @@ except Exception:
 
 # 3. Install dependencies (editable so any tweaks take effect immediately)
 !pip install -q -e .
+if RUN_LLM_EVAL:
+    !pip install -q -e ".[llm]" wandb
+
+# 2b. Load the W&B API key from Colab Secrets if available, into tokens/wandb.token.
+#     Add a secret named WANDB_API_KEY in the Colab "key" sidebar before running.
+if RUN_LLM_EVAL and WANDB_PROJECT:
+    try:
+        from google.colab import userdata  # type: ignore
+        wandb_key = userdata.get("WANDB_API_KEY")
+    except Exception:
+        wandb_key = None
+    if wandb_key:
+        os.makedirs("tokens", exist_ok=True)
+        with open("tokens/wandb.token", "w") as fh:
+            fh.write(wandb_key.strip())
+        os.environ["WANDB_API_KEY"] = wandb_key.strip()
+        print("Loaded WANDB_API_KEY from Colab secrets.")
+    else:
+        print(
+            "WANDB_API_KEY not set in Colab secrets — W&B logging will be skipped. "
+            "Add it via the 'key' icon in the Colab sidebar to enable."
+        )
+        WANDB_PROJECT = None
 
 # 4. Override the per-script config via env-var-friendly Python overrides.
 #    Each script is config-only at the top, so a tiny shim keeps the run
@@ -77,7 +106,7 @@ generate_all_tokenizers(
     continue_on_error=True,
 )
 
-# --- evaluate ---
+# --- evaluate (intrinsic metrics) ---
 from src.tools.evaluate_tokenizer import evaluate_all_tokenizers
 evaluate_all_tokenizers(
     data_dir='data',
@@ -85,6 +114,23 @@ evaluate_all_tokenizers(
     results_path='results.csv',
     continue_on_error=True,
 )
+
+# --- evaluate (downstream LLM PPL/BPB) ---
+if {RUN_LLM_EVAL}:
+    from src.tools.train_llm import train_all_llms
+    from src.utils.llm_training import LLMConfig
+    cfg = LLMConfig(
+        train_tokens={LLM_TRAIN_TOKENS},
+        wandb_project={WANDB_PROJECT!r},
+    )
+    train_all_llms(
+        data_dir='data',
+        artifact_dir='artifacts',
+        results_path='llm_results.csv',
+        config=cfg,
+        continue_on_error=True,
+        eval_flores=True,
+    )
 """
 with open("/tmp/run_pipeline.py", "w") as fh:
     fh.write(shim)
@@ -94,4 +140,12 @@ with open("/tmp/run_pipeline.py", "w") as fh:
 import pandas as pd
 df = pd.read_csv("results.csv")
 print(df.to_string(index=False))
+
+# Also display LLM results if the downstream eval ran. Look at
+# `train_bytes_per_row` to sanity-check the per-language data slice.
+if RUN_LLM_EVAL and os.path.exists("llm_results.csv"):
+    print("\n=== LLM results (PPL + BPB) ===")
+    llm_df = pd.read_csv("llm_results.csv")
+    print(llm_df.to_string(index=False))
+
 df  # last expression renders as a Colab table

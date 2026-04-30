@@ -1,6 +1,7 @@
 # Secrets and tokens (keep the folder, ignore its contents)
 tokens/*
 !tokens/.gitkeep
+!tokens/README.md
 *.token
 *.key
 *.secret
