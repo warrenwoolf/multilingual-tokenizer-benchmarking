@@ -383,11 +383,14 @@ def _train_superbpe(corpus_path: Path, vocab_size: int, output_dir: Path) -> Non
     manual approximation. If that legacy code path is ever reintroduced, it
     should fail loudly rather than silently diverge from the official repo.
     """
-    from src.tools.superbpe_runner import train_superbpe as _train_superbpe_official
+    from src.tools.superbpe_runner import (
+        SuperBPESetupError,
+        train_superbpe as _train_superbpe_official,
+    )
 
     try:
         _train_superbpe_official(corpus_path=corpus_path, vocab_size=vocab_size, output_dir=output_dir)
-    except FileNotFoundError as exc:
+    except SuperBPESetupError as exc:
         raise RuntimeError(
             "SuperBPE requires the official PythonNut/superbpe checkout with its Rust-backed tokenizers fork. "
             "Run `make install-superbpe` or execute `scripts/install_superbpe.sh` first."

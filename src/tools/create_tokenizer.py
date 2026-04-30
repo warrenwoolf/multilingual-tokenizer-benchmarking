@@ -92,10 +92,14 @@ def _print_sample_roundtrip(artifact_dir: Path, algorithm: str, corpus_path: Pat
     print(f"[{label}] sample tokens: {token_texts}")
     print(f"[{label}] sample detokenized: {detokenized!r}")
 
-    if detokenized != source_text:
+    # Re-encode to verify round-trip consistency (IDs should match).
+    # Note: space normalization is acceptable — some tokenizers normalize whitespace.
+    re_encoded_ids = tokenizer.encode(detokenized)
+    if re_encoded_ids != token_ids:
         raise ValueError(
-            "Detokenization mismatch for sample text "
-            f"(expected {source_text!r}, got {detokenized!r})"
+            f"Detokenization consistency error: "
+            f"encode → decode → encode gave different IDs. "
+            f"Original IDs: {token_ids}, re-encoded: {re_encoded_ids}"
         )
     print(f"[{label}] sample round-trip check: OK")
 

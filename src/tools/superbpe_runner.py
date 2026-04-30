@@ -11,7 +11,6 @@ import os
 import shutil
 import shlex
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -26,8 +25,12 @@ SUPERBPE_STAGE1_REGEX = (
 SUPERBPE_STAGE2_REGEX = r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]{2,}[\r\n/]*| +(?!\S)"
 
 
+class SuperBPESetupError(RuntimeError):
+    """Raised when the external SuperBPE environment is missing or incomplete."""
+
+
 def _repo_path() -> Path:
-    return Path(os.environ.get("SUPERBPE_REPO", "third_party/superbpe"))
+    return Path(os.environ.get("SUPERBPE_REPO", "third_party/superbpe")).expanduser().resolve()
 
 
 def _venv_bin_dir(repo: Path) -> Path:
@@ -42,7 +45,7 @@ def _repo_python(repo: Path) -> Path:
     python = _venv_python(repo)
     if python.exists():
         return python
-    raise FileNotFoundError(
+    raise SuperBPESetupError(
         f"SuperBPE virtualenv not found at {python}. Run scripts/install_superbpe.sh first."
     )
 
@@ -95,56 +98,58 @@ def train_superbpe(corpus_path: str | Path, vocab_size: int, output_dir: str | P
     """
     repo = _repo_path()
     if not repo.exists():
-        raise RuntimeError(
+        raise SuperBPESetupError(
             f"SuperBPE repo not found at {repo}. Run scripts/install_superbpe.sh or make install-superbpe first."
         )
 
-    corpus_path = Path(corpus_path)
-    output_dir = Path(output_dir)
+    corpus_path = Path(corpus_path).resolve()
+    output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="superbpe_corpus_") as tmpdir:
-        corpus_dir = Path(tmpdir)
-        copied_corpus = corpus_dir / corpus_path.name
-        shutil.copy2(corpus_path, copied_corpus)
-        num_bytes = corpus_path.stat().st_size
-        stage1_vocab = max(1, int(vocab_size * 0.9))
+    # Keep a stable corpus directory under the artifact so retries/debugging
+    # can rerun the exact same command without depending on a transient /tmp path.
+    corpus_dir = output_dir / ".superbpe_corpus"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    copied_corpus = corpus_dir / "train.txt"
+    shutil.copy2(corpus_path, copied_corpus)
+    num_bytes = copied_corpus.stat().st_size
+    stage1_vocab = max(1, int(vocab_size * 0.9))
 
-        _run_repo_python(
-            repo,
-            [
-                "-m",
-                "train_tokenizer",
-                "--output_dir",
-                str(output_dir),
-                "--corpus_dir",
-                str(corpus_dir),
-                "--num_bytes",
-                str(num_bytes),
-                "--vocab_size",
-                str(stage1_vocab),
-                "--regex_string",
-                SUPERBPE_STAGE1_REGEX,
-            ],
-        )
+    _run_repo_python(
+        repo,
+        [
+            "-m",
+            "train_tokenizer",
+            "--output_dir",
+            str(output_dir),
+            "--corpus_dir",
+            str(corpus_dir),
+            "--num_bytes",
+            str(num_bytes),
+            "--vocab_size",
+            str(stage1_vocab),
+            "--regex_string",
+            SUPERBPE_STAGE1_REGEX,
+        ],
+    )
 
-        _run_repo_python(
-            repo,
-            [
-                "-m",
-                "train_tokenizer",
-                "--output_dir",
-                str(output_dir),
-                "--corpus_dir",
-                str(corpus_dir),
-                "--num_bytes",
-                str(num_bytes),
-                "--vocab_size",
-                str(vocab_size),
-                "--regex_string",
-                SUPERBPE_STAGE2_REGEX,
-            ],
-        )
+    _run_repo_python(
+        repo,
+        [
+            "-m",
+            "train_tokenizer",
+            "--output_dir",
+            str(output_dir),
+            "--corpus_dir",
+            str(corpus_dir),
+            "--num_bytes",
+            str(num_bytes),
+            "--vocab_size",
+            str(vocab_size),
+            "--regex_string",
+            SUPERBPE_STAGE2_REGEX,
+        ],
+    )
 
 
 def train_stage1(repo: Path | None = None) -> int:
