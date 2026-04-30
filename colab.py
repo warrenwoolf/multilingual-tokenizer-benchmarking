@@ -20,6 +20,7 @@
 REPO_URL = "https://github.com/warrenwoolf/multilingual-tokenizer-benchmarking.git"
 BRANCH = "main" # Change this if using an unmerged branch
 REPO_DIR = "multilingual-tokenizer-benchmarking"
+SUPERBPE_REPO = "third_party/superbpe"
 
 LANGUAGES = "en,zh,tr"
 ALGORITHMS = "bpe,superbpe,tiktoken,morphbpe,wordpiece,unigram,byt5"
@@ -35,17 +36,19 @@ WANDB_PROJECT = "tokenizer-bench"  # set to None to disable W&B logging
 # ===========================================================================
 
 import os
+import subprocess
 import sys
 
 # 1. Clone the repo
 if not os.path.isdir(REPO_DIR):
     !git clone --branch {BRANCH} {REPO_URL} {REPO_DIR}
 %cd {REPO_DIR}
+os.environ["SUPERBPE_REPO"] = SUPERBPE_REPO
 
 # 1b. Install Rust for the official SuperBPE repo, which depends on the
 # patched Rust-backed tokenizers fork during training.
 !apt-get update -qq
-!apt-get install -y -qq build-essential curl
+!apt-get install -y -qq build-essential curl python3-venv
 !curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 os.environ["PATH"] = "/root/.cargo/bin:" + os.environ.get("PATH", "")
 !rustc --version
@@ -72,7 +75,19 @@ if RUN_LLM_EVAL:
 # an isolated venv under third_party/superbpe.
 if "superbpe" in ALGORITHMS.split(","):
     !chmod +x scripts/install_superbpe.sh
-    !SUPERBPE_REPO=third_party/superbpe ./scripts/install_superbpe.sh
+    os.environ["PYTHON"] = sys.executable
+    subprocess.run(["bash", "scripts/install_superbpe.sh"], check=True)
+    superbpe_repo_abs = os.path.abspath(SUPERBPE_REPO)
+    if not os.path.isdir(superbpe_repo_abs):
+        raise RuntimeError(
+            f"SuperBPE install did not create {superbpe_repo_abs}. "
+            "Check the output above for the failing command."
+        )
+    if not os.path.isfile(os.path.join(superbpe_repo_abs, ".venv", "bin", "python")):
+        raise RuntimeError(
+            f"SuperBPE checkout exists at {superbpe_repo_abs}, but its virtualenv is missing. "
+            "The install script likely failed while building the patched tokenizers wheel."
+        )
 
 # 2b. Load the W&B API key from Colab Secrets if available, into tokens/wandb.token.
 #     Add a secret named WANDB_API_KEY in the Colab "key" sidebar before running.

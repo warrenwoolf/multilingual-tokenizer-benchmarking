@@ -27,7 +27,11 @@ pushd "$SUPERBPE_REPO" >/dev/null
 
 if [ ! -d ".venv" ]; then
   echo "Creating virtualenv at $SUPERBPE_REPO/.venv"
-  $PYTHON -m venv .venv
+  if ! "$PYTHON" -m venv .venv; then
+    echo "python -m venv failed; retrying via virtualenv fallback..."
+    "$PYTHON" -m pip install --upgrade virtualenv
+    "$PYTHON" -m virtualenv .venv
+  fi
 fi
 
 VENV_PIP="$(pwd)/.venv/bin/pip"
