@@ -321,18 +321,14 @@ def test_morphbpe_rejects_unsupported_language(english_corpus, tmp_path):
         train_tokenizer(english_corpus, "morphbpe", 500, tmp_path / "x", language="zh")
 
 
-# ---------- BPE decode limitation ------------------------------------------
-# BPE is trained without end_of_word_suffix (adding it introduces non-
-# determinism in HF tokenizers' tie-breaking, breaking the training
-# determinism contract).  As a result, BPEDecoder cannot locate word
-# boundaries and concatenates all subwords without spaces.  This does not
-# affect the BPB or fertility metrics (both use encode-only), but it means
-# decode() is lossy for multi-word inputs.  This test documents that known
-# behaviour so we notice if it ever accidentally changes.
+# ---------- BPE decode ------------------------------------------
+# BPE uses a ByteLevel pre-tokenizer (Ġ prefix for word-initial subwords) and
+# a matching ByteLevel decoder, so inter-word spaces are correctly preserved
+# on decode.  This test pins that behaviour so we notice if it regresses.
 
 
 def test_bpe_decode_drops_interword_spaces(tiny_corpus, tmp_path):
-    """Documents the known decode limitation: inter-word spaces are dropped."""
+    """BPE decode preserves inter-word spaces via ByteLevel pre-tokenizer."""
     out = tmp_path / "bpe_decode_test"
     out.mkdir()
     train_tokenizer(tiny_corpus, "bpe", vocab_size=VOCAB_SIZE, output_dir=out)
@@ -340,21 +336,16 @@ def test_bpe_decode_drops_interword_spaces(tiny_corpus, tmp_path):
 
     text = "Hello world"
     decoded = tok.decode(tok.encode(text))
-    # Spaces are dropped; the decode is concatenative.
-    assert " " not in decoded, (
-        "BPE decode is unexpectedly preserving spaces — the end_of_word_suffix "
-        "limitation may have been fixed; update this test and the docstring in "
-        "_train_bpe if so."
+    assert " " in decoded, (
+        "BPE decode should preserve inter-word spaces via ByteLevel pre-tokenizer."
     )
 
 
 # ---------- MorphBPE decode behaviour --------------------------------------
-# Documents (and pins) the known limitation: because the segmented training
-# corpus does not distinguish morpheme-boundary spaces from word-boundary
-# spaces, the trained tokenizer cannot reconstruct inter-word spaces on
-# decode().  Single-word inputs round-trip correctly; multi-word inputs lose
-# the space.  The BPB / fertility pipelines only call encode(), so this does
-# not affect benchmark results.
+# MorphBPE uses a ByteLevel pre-tokenizer so the Ġ prefix on word-initial
+# subwords encodes inter-word boundaries.  The ByteLevel decoder reverses
+# this, reconstructing spaces correctly for both single-word and multi-word
+# inputs.
 
 
 def test_morphbpe_single_word_decode_is_lossless(morphbpe_tokenizer):
@@ -367,13 +358,11 @@ def test_morphbpe_single_word_decode_is_lossless(morphbpe_tokenizer):
 
 
 def test_morphbpe_multiword_decode_drops_spaces(morphbpe_tokenizer):
-    """Multi-word decode is known to lose inter-word spaces (documented limitation)."""
+    """Multi-word decode preserves inter-word spaces via ByteLevel pre-tokenizer."""
     text = "playing tennis"
     decoded = morphbpe_tokenizer.decode(morphbpe_tokenizer.encode(text))
-    # The limitation: spaces are dropped.
-    assert " " not in decoded, (
-        "If this assertion fails, MorphBPE decode now preserves spaces — "
-        "update the limitation note in _train_morphbpe and this test."
+    assert " " in decoded, (
+        "MorphBPE decode should preserve inter-word spaces via ByteLevel pre-tokenizer."
     )
 
 
@@ -496,11 +485,11 @@ def test_morphbpe_segment_corpus_splits_at_morpheme_boundaries(
 ):
     """The preprocessing approach inserts spaces at morpheme boundaries.
 
-    BPE with a Whitespace pre-tokenizer cannot count or learn merges across
-    spaces, so replacing 'running' with 'run n ing' in the training corpus
-    guarantees no cross-morpheme merge is ever learned.  This is what
-    makes the approach equivalent to Algorithm 1 of Asgari et al. 2025
-    for the *training* path.
+    BPE with a ByteLevel pre-tokenizer splits on whitespace, so it cannot
+    count or learn merges across spaces.  Replacing 'running' with 'run n ing'
+    in the training corpus guarantees no cross-morpheme merge is ever learned.
+    This is what makes the approach equivalent to Algorithm 1 of Asgari et al.
+    2025 for the *training* path.
 
     Note: the guarantee does NOT extend to inference.  When BPE tokenizes
     the raw word 'running' (no spaces) it can compose within-morpheme merges
