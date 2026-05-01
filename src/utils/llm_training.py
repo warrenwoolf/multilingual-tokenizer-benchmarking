@@ -111,10 +111,12 @@ class LLMConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
     warmup_steps: int = 100
-    # Eval interval in training steps; 0 disables mid-training eval entirely.
-    # At the default 1B tokens / 65K tok/step ≈ 15K steps, eval_every=2500
-    # gives ~6 evals. Tune to match your total_steps.
-    eval_every: int = 2500
+    # Number of evenly-spaced evals to run *during* training (not counting the
+    # pre-training random-init eval or the final post-training eval).  The
+    # actual step interval is computed as max(1, total_steps // n_mid_evals) so
+    # it scales automatically with batch size and vocab-size adjustments.
+    # Set to 0 to disable mid-training eval entirely.
+    n_mid_evals: int = 5
 
     # Misc
     seed: int = 0
@@ -483,9 +485,10 @@ def train_lm_transformers(
     """Train using HuggingFace ``Trainer`` and return the same result tuple
     as ``train_lm()`` for compatibility.
 
-    When ``eval_corpus`` is provided and ``cfg.eval_every > 0``, a mid-training
-    eval callback fires every ``eval_every`` steps, logging rich metrics to W&B
-    and (optionally) saving checkpoints to ``checkpoint_dir``.
+    When ``eval_corpus`` is provided, evaluates the randomly-initialised model
+    at step 0, then fires ``cfg.n_mid_evals`` evenly-spaced evals during
+    training, logging rich metrics to W&B and saving checkpoints to
+    ``checkpoint_dir``.
     """
     import numpy as np
     import torch
@@ -557,7 +560,89 @@ def train_lm_transformers(
         report_to=[],  # all W&B logging is handled by our callbacks
     )
 
+    # Eval interval: divide training evenly so exactly n_mid_evals checkpoints
+    # land during training regardless of how batch size was scaled for vocab.
+    _eval_every = max(1, total_steps // cfg.n_mid_evals) if cfg.n_mid_evals > 0 else 0
+
+    if _eval_every > 0 and eval_corpus is not None:
+        log_fn(
+            f"  eval schedule: step 0 (init) + every {_eval_every} steps "
+            f"× {cfg.n_mid_evals} = {1 + cfg.n_mid_evals} callback evals total"
+        )
+
     t_start = time.time()
+
+    # ------------------------------------------------------------------
+    # Shared eval + checkpoint logic (called at step 0 and in the callback)
+    # ------------------------------------------------------------------
+
+    def _run_eval_at_step(hf_model_ref, step: int, dev, amp) -> None:
+        """Evaluate model, save checkpoint, log to W&B.  Raises on hard errors."""
+        if eval_corpus is None:
+            return
+
+        wrapped = HFWrapper(hf_model_ref)
+        label = "init" if step == 0 else f"{step}/{total_steps}"
+
+        t_eval = time.time()
+        try:
+            test_m = _score_corpus(wrapped, eval_corpus, cfg, dev, amp)
+        except Exception as exc:
+            log_fn(f"  [eval {label}] test scoring failed: {exc}")
+            raise
+
+        flores_m: dict = {}
+        if flores_corpus is not None:
+            try:
+                flores_m = _score_corpus(wrapped, flores_corpus, cfg, dev, amp)
+            except Exception as exc:
+                log_fn(f"  [eval {label}] flores scoring failed: {exc}")
+
+        eval_time = time.time() - t_eval
+        tokens_seen = step * tokens_per_step
+        wall_time = time.time() - t_start
+        flops = _flops(_param_count, tokens_seen)
+
+        test_bpb = test_m.get("bits_per_byte", float("nan"))
+        flores_bpb = flores_m.get("bits_per_byte", float("nan"))
+        log_fn(
+            f"  [eval {label}]"
+            f"  test_bpb={test_bpb:.4f}"
+            + (f"  flores_bpb={flores_bpb:.4f}" if flores_m else "")
+            + f"  eval_time={eval_time:.1f}s"
+        )
+
+        if checkpoint_dir is not None:
+            ckpt_path = Path(checkpoint_dir) / f"step_{step:07d}.pt"
+            _save_checkpoint_to_path(wrapped, cfg, _vocab_size, ckpt_path)
+            log_fn(f"  [eval {label}] checkpoint saved → {ckpt_path}")
+            if wandb_run is not None and artifact_name is not None:
+                _upload_checkpoint_artifact(wandb_run, ckpt_path, artifact_name, step)
+                log_fn(f"  [eval {label}] checkpoint uploaded to W&B artifact '{artifact_name}'")
+
+        if wandb_run is not None:
+            log_dict: dict = {
+                "train/tokens_seen": tokens_seen,
+                "train/bytes_seen": int(tokens_seen * _bytes_per_token),
+                "train/rows_seen": tokens_seen * _rows_per_token,
+                "train/wall_time_s": wall_time,
+                "train/flops": flops,
+                "eval/eval_time_s": eval_time,
+            }
+            for k, v in test_m.items():
+                log_dict[f"eval/test_{k}"] = v
+            for k, v in flores_m.items():
+                log_dict[f"eval/flores_{k}"] = v
+            wandb_run.log(log_dict, step=step)
+
+    # ------------------------------------------------------------------
+    # Step-0 eval: random-init baseline before any training
+    # ------------------------------------------------------------------
+    if _eval_every > 0 and eval_corpus is not None:
+        # Model is on CPU at this point; the Trainer will move it to the target
+        # device when .train() is called.  Evaluate on CPU with no autocast so
+        # the baseline measurement is independent of device availability.
+        _run_eval_at_step(hf_model, step=0, dev=torch.device("cpu"), amp=None)
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -601,89 +686,25 @@ def train_lm_transformers(
                 wandb_run.log(log_dict, step=step)
 
     class _EvalAndCheckpointCallback(TrainerCallback):
-        """Runs mid-training eval and saves checkpoints every eval_every steps."""
+        """Fires eval at evenly-spaced steps computed from n_mid_evals."""
 
         def on_step_end(self, args, state, control, model=None, **kwargs):
-            if cfg.eval_every <= 0 or eval_corpus is None:
+            if _eval_every <= 0 or eval_corpus is None:
                 return control
             step = int(getattr(state, "global_step", 0))
-            if step == 0 or step % cfg.eval_every != 0:
+            if step == 0 or step % _eval_every != 0:
                 return control
             if model is None:
-                log_fn(f"  [eval step {step}] model not available in callback, skipping")
+                log_fn(f"  [eval {step}/{total_steps}] model not in callback, skipping")
                 return control
 
-            tokens_seen = step * tokens_per_step
-            wall_time = time.time() - t_start
-            flops = _flops(_param_count, tokens_seen)
-
-            model.eval()
-            wrapped = HFWrapper(model)
             _dev = next(model.parameters()).device
             _amp = resolve_amp_dtype(cfg.dtype, _dev)
-
-            t_eval = time.time()
+            model.eval()
             try:
-                test_m = _score_corpus(wrapped, eval_corpus, cfg, _dev, _amp)
-            except Exception as exc:
-                log_fn(f"  [eval step {step}] test scoring failed: {exc}")
+                _run_eval_at_step(model, step=step, dev=_dev, amp=_amp)
+            finally:
                 model.train()
-                return control
-
-            flores_m: dict = {}
-            if flores_corpus is not None:
-                try:
-                    flores_m = _score_corpus(wrapped, flores_corpus, cfg, _dev, _amp)
-                except Exception as exc:
-                    log_fn(f"  [eval step {step}] flores scoring failed: {exc}")
-
-            eval_time = time.time() - t_eval
-            model.train()
-
-            test_bpb = test_m.get("bits_per_byte", float("nan"))
-            flores_bpb = flores_m.get("bits_per_byte", float("nan"))
-            log_fn(
-                f"  [eval step {step}/{total_steps}]"
-                f"  test_bpb={test_bpb:.4f}"
-                + (f"  flores_bpb={flores_bpb:.4f}" if flores_m else "")
-                + f"  eval_time={eval_time:.1f}s"
-            )
-
-            # Save checkpoint to persistent storage.
-            if checkpoint_dir is not None:
-                ckpt_path = Path(checkpoint_dir) / f"step_{step:07d}.pt"
-                try:
-                    _save_checkpoint_to_path(wrapped, cfg, _vocab_size, ckpt_path)
-                    log_fn(f"  [eval step {step}] checkpoint saved → {ckpt_path}")
-                except Exception as exc:
-                    log_fn(f"  [eval step {step}] checkpoint save FAILED: {exc}")
-                    raise
-
-                if wandb_run is not None and artifact_name is not None:
-                    _upload_checkpoint_artifact(
-                        wandb_run,
-                        ckpt_path,
-                        artifact_name,
-                        step,
-                    )
-                    log_fn(f"  [eval step {step}] checkpoint uploaded to W&B artifact '{artifact_name}'")
-
-            # Log eval metrics to W&B.
-            if wandb_run is not None:
-                log_dict: dict = {
-                    "train/tokens_seen": tokens_seen,
-                    "train/bytes_seen": int(tokens_seen * _bytes_per_token),
-                    "train/rows_seen": tokens_seen * _rows_per_token,
-                    "train/wall_time_s": wall_time,
-                    "train/flops": flops,
-                    "eval/eval_time_s": eval_time,
-                }
-                for k, v in test_m.items():
-                    log_dict[f"eval/test_{k}"] = v
-                for k, v in flores_m.items():
-                    log_dict[f"eval/flores_{k}"] = v
-                wandb_run.log(log_dict, step=step)
-
             return control
 
     def collate_fn(batch):
@@ -1039,7 +1060,7 @@ def train_and_evaluate(
 
     # Set up a persistent checkpoint directory alongside the tokenizer artifact.
     checkpoint_dir: Path | None = None
-    if cfg.eval_every > 0:
+    if cfg.n_mid_evals > 0:
         if tokenizer_artifact_dir is not None:
             checkpoint_dir = Path(tokenizer_artifact_dir) / "checkpoints" / run_timestamp
         else:
