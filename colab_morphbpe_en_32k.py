@@ -1,8 +1,10 @@
 #@title MorphBPE English 32k — case-sensitivity fix validation run
 # ---------------------------------------------------------------------------
-# Paste this entire file into a Google Colab cell and run it.
+# Paste this entire file into a Google Colab cell and run it. Requires a GPU
+# runtime for the LLM training step.
 # Trains ONLY MorphBPE on English with a 32k vocab using the
-# fix/morphbpe-case-sensitivity branch, then runs intrinsic evaluation.
+# fix/morphbpe-case-sensitivity branch, runs intrinsic evaluation, then
+# trains the downstream LLM and reports BPB.
 # ---------------------------------------------------------------------------
 
 # === SETTINGS ==============================================================
@@ -16,7 +18,8 @@ VOCAB_SIZES = "32000"
 MAX_TRAIN_ROWS = 100_000
 MAX_EVAL_ROWS = 5_000
 
-RUN_LLM_EVAL = False
+LLM_TRAIN_TOKENS = 50_000_000      # 1B for a full Chinchilla-optimal run
+WANDB_PROJECT = "tokenizer-bench"  # set to None to disable W&B logging
 # ===========================================================================
 
 import os
@@ -38,11 +41,29 @@ try:
 except Exception:
     pass
 
-# 3. Install dependencies
-print("[colab] Installing dependencies...", flush=True)
-!pip install -q -e .
+# 3. Load W&B key from Colab Secrets
+_wandb_project = WANDB_PROJECT
+if _wandb_project:
+    try:
+        from google.colab import userdata as _userdata
+        _wandb_key = _userdata.get('WANDB_API_KEY')
+    except Exception:
+        _wandb_key = None
+    if _wandb_key:
+        os.makedirs("tokens", exist_ok=True)
+        with open("tokens/wandb.token", "w") as fh:
+            fh.write(_wandb_key.strip())
+        os.environ["WANDB_API_KEY"] = _wandb_key.strip()
+        print("Loaded WANDB_API_KEY from Colab secrets.")
+    else:
+        print("WANDB_API_KEY not set — W&B logging disabled.")
+        _wandb_project = None
 
-# 4. Run pipeline
+# 4. Install dependencies
+print("[colab] Installing dependencies...", flush=True)
+!pip install -q -e ".[llm]" wandb
+
+# 5. Run pipeline
 shim = f"""
 import sys
 sys.path.insert(0, '.')
@@ -73,18 +94,39 @@ evaluate_all_tokenizers(
     results_path='results.csv',
     continue_on_error=False,
 )
+
+from src.tools.train_llm import train_all_llms
+from src.utils.llm_training import LLMConfig
+cfg = LLMConfig(
+    train_tokens={LLM_TRAIN_TOKENS},
+    wandb_project={_wandb_project!r},
+)
+train_all_llms(
+    data_dir='data',
+    artifact_dir='artifacts',
+    results_path='llm_results.csv',
+    config=cfg,
+    continue_on_error=False,
+    eval_flores=True,
+)
 """
 with open("/tmp/run_pipeline.py", "w") as fh:
     fh.write(shim)
 !python /tmp/run_pipeline.py
 
-# 5. Display results
+# 6. Display results
 import pandas as pd
 if os.path.exists("results.csv"):
+    print("=== Intrinsic metrics ===")
     df = pd.read_csv("results.csv")
     print(df.to_string(index=False))
 else:
     df = None
     print("[colab] results.csv not found.")
+
+if os.path.exists("llm_results.csv"):
+    print("\n=== LLM results (BPB) ===")
+    llm_df = pd.read_csv("llm_results.csv")
+    print(llm_df.to_string(index=False))
 
 df
