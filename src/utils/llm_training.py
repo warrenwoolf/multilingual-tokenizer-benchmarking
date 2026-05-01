@@ -978,21 +978,6 @@ def _log_model_artifact(
     wandb_run.log_artifact(art)
 
 
-def _define_wandb_metrics(wandb_run) -> None:
-    """Register metric definitions so W&B knows which x-axes to use.
-
-    All train/* and eval/* metrics use the global training step as their
-    primary x-axis.  In the W&B UI you can create additional custom panels
-    using train/flops or train/wall_time_s as x-axes to get the BPB-vs-compute
-    and BPB-vs-time curves.
-    """
-    import wandb
-
-    wandb.define_metric("train/step")
-    wandb.define_metric("train/*", step_metric="train/step")
-    wandb.define_metric("eval/*", step_metric="train/step")
-
-
 # ---------------------------------------------------------------------------
 # W&B run init
 # ---------------------------------------------------------------------------
@@ -1008,7 +993,7 @@ def _init_wandb(cfg: LLMConfig, extra_config: dict | None = None):
     init_config = asdict(cfg)
     if extra_config:
         init_config.update(extra_config)
-    run = wandb.init(
+    return wandb.init(
         project=cfg.wandb_project,
         entity=cfg.wandb_entity,
         name=cfg.wandb_run_name,
@@ -1016,8 +1001,6 @@ def _init_wandb(cfg: LLMConfig, extra_config: dict | None = None):
         config=init_config,
         reinit=True,
     )
-    _define_wandb_metrics(run)
-    return run
 
 
 # ---------------------------------------------------------------------------
