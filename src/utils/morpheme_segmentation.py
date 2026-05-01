@@ -135,6 +135,20 @@ def _train_morfessor(word_counts: Counter[str], max_types: int):
 _PUNCT_RE = re.compile(r"^\W+$", flags=re.UNICODE)
 
 
+def _apply_casing(original: str, morphemes: list[str]) -> list[str]:
+    """Transfer the casing pattern of *original* onto *morphemes*.
+
+    - all-caps ("FARMERS")   → uppercase every morpheme ("FARMER", "S")
+    - title-case ("Farmers") → capitalise first char of first morpheme only
+    - lower / mixed          → return morphemes unchanged
+    """
+    if original.isupper():
+        return [m.upper() for m in morphemes]
+    if original[0].isupper():
+        return [morphemes[0][0].upper() + morphemes[0][1:]] + morphemes[1:]
+    return morphemes
+
+
 def _segment_word(
     segmenter_fn: Callable[[str], list[str]],
     word: str,
@@ -190,20 +204,6 @@ def segment_corpus(
 
     cache_dir = morphynet_cache_dir if morphynet_cache_dir is not None else MORPHYNET_DEFAULT_CACHE
     lookup = _load_morphynet(language, cache_dir)
-    def _apply_casing(original: str, morphemes: list[str]) -> list[str]:
-        """Transfer the casing pattern of *original* onto *morphemes*.
-
-        Three cases:
-          - all-caps ("FARMERS")  → uppercase every morpheme ("FARMER", "S")
-          - title-case ("Farmers") → capitalise first char of first morpheme only
-          - mixed/lower           → return morphemes unchanged
-        """
-        if original.isupper():
-            return [m.upper() for m in morphemes]
-        if original[0].isupper():
-            return [morphemes[0][0].upper() + morphemes[0][1:]] + morphemes[1:]
-        return morphemes
-
     def segmenter_fn(w: str) -> list[str]:
         segs = lookup.get(w)
         if segs is not None:

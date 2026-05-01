@@ -201,7 +201,14 @@ class MorphBPEAdapter:
     _seg_cache: dict = field(default_factory=dict, repr=False)
 
     def _segmenter(self, word: str) -> list[str]:
-        return self.lookup.get(word, [word])
+        segs = self.lookup.get(word)
+        if segs is not None:
+            return segs
+        segs = self.lookup.get(word.lower())
+        if segs is None:
+            return [word]
+        from src.utils.morpheme_segmentation import _apply_casing
+        return _apply_casing(word, segs)
 
     def encode(self, text: str) -> list[int]:
         if text == "":
