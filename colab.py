@@ -59,6 +59,7 @@ import subprocess
 import sys
 
 # 1. Clone the repo
+%cd "/content"
 if not os.path.isdir(REPO_DIR):
     !git clone --branch {BRANCH} {REPO_URL} {REPO_DIR}
 %cd {REPO_DIR}
