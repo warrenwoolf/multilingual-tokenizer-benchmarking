@@ -58,6 +58,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, asdict, field
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -110,7 +111,12 @@ class LLMConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
     warmup_steps: int = 100
-    eval_every: int = 0  # 0 = only at end
+    # Number of evenly-spaced evals to run *during* training (not counting the
+    # pre-training random-init eval or the final post-training eval).  The
+    # actual step interval is computed as max(1, total_steps // n_mid_evals) so
+    # it scales automatically with batch size and vocab-size adjustments.
+    # Set to 0 to disable mid-training eval entirely.
+    n_mid_evals: int = 5
 
     # Misc
     seed: int = 0
@@ -195,9 +201,6 @@ def resolve_eos_id(tokenizer) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-
-
-
 def _build_hf_model(vocab_size: int, cfg: LLMConfig):
     """Build a HuggingFace GPT2-style model matching our `LLMConfig`.
 
@@ -258,6 +261,11 @@ def count_parameters(model) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def _sample_batch(*args, **kwargs):
+    """Removed: manual batch sampling was replaced by HF Trainer's DataLoader."""
+    raise RuntimeError("Manual sampling is removed")
+
+
 # ---------------------------------------------------------------------------
 # Tokenization helpers
 # ---------------------------------------------------------------------------
@@ -277,7 +285,7 @@ class TokenizedCorpus:
 
     The byte count (``source_bytes``) is the raw UTF-8 byte length of the
     *consumed* portion of the source text — i.e. it accounts for early stops
-    on ``max_tokens``. This is what BPB normalizes by, and dividing by
+    on ``max_tokens``. This is what BPB normalises by, and dividing by
     ``rows`` gives the bytes-per-row sanity-check indicator.
     """
 
@@ -349,10 +357,91 @@ def tokenize_corpus(
     return TokenizedCorpus(ids=arr, rows=rows, source_bytes=src_bytes)
 
 
+def _tokenize_sentences_to_corpus(
+    tokenizer,
+    sentences: list[str],
+    eos_id: int | None,
+) -> TokenizedCorpus:
+    """Tokenize a list of sentences into a single ``TokenizedCorpus``.
+
+    Mirrors the encoding logic in ``evaluate_perplexity_on_sentences`` so that
+    pre-tokenized corpora passed to the training loop produce identical scores.
+    Source bytes are measured on the space-joined text (one separator per
+    inter-sentence gap), matching the original scorer.
+    """
+    import numpy as np
+
+    cleaned = [s.strip() for s in sentences if s and s.strip()]
+    if not cleaned:
+        raise RuntimeError("No non-empty sentences to tokenize.")
+    all_ids: list[int] = []
+    for sentence in cleaned:
+        s_ids = tokenizer.encode(sentence)
+        if not s_ids:
+            continue
+        all_ids.extend(s_ids)
+        if eos_id is not None:
+            all_ids.append(eos_id)
+    if not all_ids:
+        raise RuntimeError("Tokenizer produced 0 ids for sentence list.")
+    joined = " ".join(cleaned)
+    return TokenizedCorpus(
+        ids=np.asarray(all_ids, dtype=np.int32),
+        rows=len(cleaned),
+        source_bytes=len(joined.encode("utf-8")),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+
+def _flops(param_count: int, tokens: int) -> int:
+    """Approximate training FLOPs via the Chinchilla 6·N·D rule."""
+    return 6 * param_count * tokens
+
+
+def _save_checkpoint_to_path(model, cfg: LLMConfig, vocab_size: int, path: Path) -> None:
+    """Save model state dict + config to *path* (created if missing)."""
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "vocab_size": vocab_size,
+            "config": asdict(cfg),
+        },
+        path,
+    )
+
+
+def _upload_checkpoint_artifact(
+    wandb_run,
+    path: Path,
+    artifact_name: str,
+    step: int,
+) -> None:
+    """Upload *path* as a new version of the named W&B model artifact.
+
+    Raises on any failure — callers must not silently swallow this.
+    Each call creates a new artifact version; W&B assigns v0, v1, … automatically.
+    """
+    import wandb
+
+    art = wandb.Artifact(
+        name=artifact_name,
+        type="model",
+        metadata={"step": step},
+    )
+    art.add_file(str(path), name=path.name)
+    wandb_run.log_artifact(art)
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-
 
 
 class _WindowDataset:
@@ -379,18 +468,37 @@ class _WindowDataset:
         return {"input_ids": torch.from_numpy(x).long(), "labels": torch.from_numpy(y).long()}
 
 
-def train_lm_transformers(tokenizer, train_corpus_path: Path, cfg: LLMConfig, log_fn=print, wandb_run=None):
-    """Train using HuggingFace `transformers.Trainer` and return the same
-    result tuple as `train_lm()` for compatibility.
+def train_lm_transformers(
+    tokenizer,
+    train_corpus_path: Path,
+    cfg: LLMConfig,
+    log_fn=print,
+    wandb_run=None,
+    *,
+    eval_corpus: "TokenizedCorpus | None" = None,
+    flores_corpus: "TokenizedCorpus | None" = None,
+    checkpoint_dir: "Path | None" = None,
+    artifact_name: "str | None" = None,
+    run_timestamp: "str | None" = None,
+    vocab_size: "int | None" = None,
+):
+    """Train using HuggingFace ``Trainer`` and return the same result tuple
+    as ``train_lm()`` for compatibility.
+
+    When ``eval_corpus`` is provided, evaluates the randomly-initialised model
+    at step 0, then fires ``cfg.n_mid_evals`` evenly-spaced evals during
+    training, logging rich metrics to W&B and saving checkpoints to
+    ``checkpoint_dir``.
     """
-    # Lazy imports
     import numpy as np
     import torch
     from transformers import TrainingArguments, Trainer, TrainerCallback
 
     log_fn("  using HuggingFace Trainer path")
 
-    # Tokenize (same as manual path)
+    # ------------------------------------------------------------------
+    # Tokenize training corpus
+    # ------------------------------------------------------------------
     eos_id = resolve_eos_id(tokenizer)
     train_corpus = tokenize_corpus(tokenizer, train_corpus_path, max_tokens=cfg.train_tokens, eos_id=eos_id)
     train_ids = train_corpus.ids
@@ -401,12 +509,14 @@ def train_lm_transformers(tokenizer, train_corpus_path: Path, cfg: LLMConfig, lo
             f"need at least ctx_len+2={cfg.ctx_len + 2}."
         )
 
-    # Compute training steps to match existing budget
     tokens_per_step = cfg.batch_size * cfg.ctx_len
     total_steps = max(1, cfg.train_tokens // tokens_per_step)
     log_fn(f"  training (HF Trainer): {total_steps} steps × {tokens_per_step:,} tokens/step")
 
-    # Prepare starts array (one start per sample)
+    # Pre-compute per-token scaling factors for progress metrics.
+    _bytes_per_token = train_corpus.source_bytes / max(1, train_corpus.n_tokens)
+    _rows_per_token = train_corpus.rows / max(1, train_corpus.n_tokens)
+
     n = train_ids.shape[0]
     high = n - cfg.ctx_len
     if high <= 0:
@@ -415,38 +525,132 @@ def train_lm_transformers(tokenizer, train_corpus_path: Path, cfg: LLMConfig, lo
     rng = np.random.RandomState(cfg.seed)
     starts = rng.randint(0, high, size=total_samples, dtype=np.int64)
 
-    # Dataset that yields windows on demand
     ds = _WindowDataset(train_ids, starts, cfg.ctx_len)
 
-    # Build HF model and wrap for later evaluation compatibility
     hf_model = _build_hf_model(tokenizer.vocab_size, cfg)
+    _param_count = count_parameters(hf_model)
+    _vocab_size = vocab_size if vocab_size is not None else tokenizer.vocab_size
 
-    # TrainingArguments
-    import tempfile
-    outdir = tempfile.mkdtemp(prefix="hf-trainer-")
-    per_device_bs = cfg.batch_size
-    fp16 = False
     device = resolve_device(cfg.device)
     amp_dtype = resolve_amp_dtype(cfg.dtype, device)
-    if amp_dtype is not None and amp_dtype == torch.float16:
-        fp16 = True
 
+    import tempfile
+    outdir = tempfile.mkdtemp(prefix="hf-trainer-")
+    fp16 = amp_dtype is not None and amp_dtype.__name__ == "float16" if hasattr(amp_dtype, "__name__") else False
+    try:
+        import torch as _t
+        fp16 = amp_dtype is not None and amp_dtype == _t.float16
+    except Exception:
+        pass
+
+    # We handle all W&B logging ourselves so the Trainer doesn't double-log.
     training_args = TrainingArguments(
         output_dir=outdir,
-        per_device_train_batch_size=per_device_bs,
+        per_device_train_batch_size=cfg.batch_size,
         max_steps=total_steps,
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
         warmup_steps=cfg.warmup_steps,
-        logging_steps=max(1, total_steps // 100),
+        # Log ~100 times per run regardless of length; respect log_every as a cap.
+        logging_steps=max(1, min(cfg.log_every, total_steps // 100)),
         remove_unused_columns=False,
         fp16=fp16,
         gradient_accumulation_steps=1,
         optim="adamw_torch",
-        report_to=["wandb"] if wandb_run is not None else [],
+        report_to=[],  # all W&B logging is handled by our callbacks
     )
 
-    class _LossLoggingCallback(TrainerCallback):
+    # Eval interval: divide training evenly so exactly n_mid_evals checkpoints
+    # land during training regardless of how batch size was scaled for vocab.
+    _eval_every = max(1, total_steps // cfg.n_mid_evals) if cfg.n_mid_evals > 0 else 0
+
+    if _eval_every > 0 and eval_corpus is not None:
+        log_fn(
+            f"  eval schedule: step 0 (init) + every {_eval_every} steps "
+            f"× {cfg.n_mid_evals} = {1 + cfg.n_mid_evals} callback evals total"
+        )
+
+    t_start = time.time()
+
+    # ------------------------------------------------------------------
+    # Shared eval + checkpoint logic (called at step 0 and in the callback)
+    # ------------------------------------------------------------------
+
+    def _run_eval_at_step(hf_model_ref, step: int, dev, amp) -> None:
+        """Evaluate model, save checkpoint, log to W&B.  Raises on hard errors."""
+        if eval_corpus is None:
+            return
+
+        wrapped = HFWrapper(hf_model_ref)
+        label = "init" if step == 0 else f"{step}/{total_steps}"
+
+        t_eval = time.time()
+        try:
+            test_m = _score_corpus(wrapped, eval_corpus, cfg, dev, amp)
+        except Exception as exc:
+            log_fn(f"  [eval {label}] test scoring failed: {exc}")
+            raise
+
+        flores_m: dict = {}
+        if flores_corpus is not None:
+            try:
+                flores_m = _score_corpus(wrapped, flores_corpus, cfg, dev, amp)
+            except Exception as exc:
+                log_fn(f"  [eval {label}] flores scoring failed: {exc}")
+
+        eval_time = time.time() - t_eval
+        tokens_seen = step * tokens_per_step
+        wall_time = time.time() - t_start
+        flops = _flops(_param_count, tokens_seen)
+
+        test_bpb = test_m.get("bits_per_byte", float("nan"))
+        flores_bpb = flores_m.get("bits_per_byte", float("nan"))
+        log_fn(
+            f"  [eval {label}]"
+            f"  test_bpb={test_bpb:.4f}"
+            + (f"  flores_bpb={flores_bpb:.4f}" if flores_m else "")
+            + f"  eval_time={eval_time:.1f}s"
+        )
+
+        if checkpoint_dir is not None:
+            ckpt_path = Path(checkpoint_dir) / f"step_{step:07d}.pt"
+            _save_checkpoint_to_path(wrapped, cfg, _vocab_size, ckpt_path)
+            log_fn(f"  [eval {label}] checkpoint saved → {ckpt_path}")
+            if wandb_run is not None and artifact_name is not None:
+                _upload_checkpoint_artifact(wandb_run, ckpt_path, artifact_name, step)
+                log_fn(f"  [eval {label}] checkpoint uploaded to W&B artifact '{artifact_name}'")
+
+        if wandb_run is not None:
+            log_dict: dict = {
+                "train/tokens_seen": tokens_seen,
+                "train/bytes_seen": int(tokens_seen * _bytes_per_token),
+                "train/rows_seen": tokens_seen * _rows_per_token,
+                "train/wall_time_s": wall_time,
+                "train/flops": flops,
+                "eval/eval_time_s": eval_time,
+            }
+            for k, v in test_m.items():
+                log_dict[f"eval/test_{k}"] = v
+            for k, v in flores_m.items():
+                log_dict[f"eval/flores_{k}"] = v
+            wandb_run.log(log_dict, step=step)
+
+    # ------------------------------------------------------------------
+    # Step-0 eval: random-init baseline before any training
+    # ------------------------------------------------------------------
+    if _eval_every > 0 and eval_corpus is not None:
+        # Model is on CPU at this point; the Trainer will move it to the target
+        # device when .train() is called.  Evaluate on CPU with no autocast so
+        # the baseline measurement is independent of device availability.
+        _run_eval_at_step(hf_model, step=0, dev=torch.device("cpu"), amp=None)
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+
+    class _TrainingMetricsCallback(TrainerCallback):
+        """Logs training loss + rich progress metrics to stdout and W&B."""
+
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
                 return
@@ -455,33 +659,75 @@ def train_lm_transformers(tokenizer, train_corpus_path: Path, cfg: LLMConfig, lo
             if loss is None:
                 return
             step = int(getattr(state, "global_step", 0))
-            if lr is None:
-                log_fn(f"    step {step:>5}/{total_steps}  loss={float(loss):.4f}")
-            else:
-                log_fn(f"    step {step:>5}/{total_steps}  loss={float(loss):.4f}  lr={float(lr):.2e}")
+            tokens_seen = step * tokens_per_step
+            wall_time = time.time() - t_start
+            flops = _flops(_param_count, tokens_seen)
+            throughput = tokens_seen / wall_time if wall_time > 0 else 0.0
+
+            parts = [f"    step {step:>5}/{total_steps}  loss={float(loss):.4f}"]
+            if lr is not None:
+                parts.append(f"lr={float(lr):.2e}")
+            parts.append(f"tok={tokens_seen / 1e6:.1f}M")
+            parts.append(f"flops={flops:.2e}")
+            log_fn("  ".join(parts))
+
+            if wandb_run is not None:
+                log_dict: dict = {
+                    "train/loss": float(loss),
+                    "train/tokens_seen": tokens_seen,
+                    "train/bytes_seen": int(tokens_seen * _bytes_per_token),
+                    "train/rows_seen": tokens_seen * _rows_per_token,
+                    "train/flops": flops,
+                    "train/wall_time_s": wall_time,
+                    "train/throughput_tok_s": throughput,
+                }
+                if lr is not None:
+                    log_dict["train/lr"] = float(lr)
+                wandb_run.log(log_dict, step=step)
+
+    class _EvalAndCheckpointCallback(TrainerCallback):
+        """Fires eval at evenly-spaced steps computed from n_mid_evals."""
+
+        def on_step_end(self, args, state, control, model=None, **kwargs):
+            if _eval_every <= 0 or eval_corpus is None:
+                return control
+            step = int(getattr(state, "global_step", 0))
+            if step == 0 or step % _eval_every != 0:
+                return control
+            if model is None:
+                log_fn(f"  [eval {step}/{total_steps}] model not in callback, skipping")
+                return control
+
+            _dev = next(model.parameters()).device
+            _amp = resolve_amp_dtype(cfg.dtype, _dev)
+            model.eval()
+            try:
+                _run_eval_at_step(model, step=step, dev=_dev, amp=_amp)
+            finally:
+                model.train()
+            return control
 
     def collate_fn(batch):
-        # batch is a list of dicts; stack tensors
         import torch
 
         input_ids = torch.stack([b["input_ids"] for b in batch])
         labels = torch.stack([b["labels"] for b in batch])
         return {"input_ids": input_ids, "labels": labels}
 
+    callbacks = [_TrainingMetricsCallback(), _EvalAndCheckpointCallback()]
+
     trainer = Trainer(
         model=hf_model,
         args=training_args,
         train_dataset=ds,
         data_collator=collate_fn,
-        callbacks=[_LossLoggingCallback()],
+        callbacks=callbacks,
     )
 
     t0 = time.time()
     trainer.train()
     train_seconds = time.time() - t0
 
-    # Free Trainer internals (optimizer states, gradient scaler, etc.) immediately
-    # so they don't compete with the eval pass and subsequent runs for GPU memory.
     del trainer
     import gc
     gc.collect()
@@ -493,31 +739,9 @@ def train_lm_transformers(tokenizer, train_corpus_path: Path, cfg: LLMConfig, lo
     import shutil
     shutil.rmtree(outdir, ignore_errors=True)
 
-    # Wrap HF model to present the old interface
     wrapped = HFWrapper(hf_model)
-    # Move model to device for downstream scoring
     wrapped.to(device)
     return wrapped, device, amp_dtype, train_seconds, train_corpus
-
-
-def _init_wandb(cfg: LLMConfig, extra_config: dict | None = None):
-    """Start a wandb run if cfg.wandb_project is set; otherwise return None."""
-    if not cfg.wandb_project:
-        return None
-    _ensure_wandb_login()
-    import wandb
-
-    init_config = asdict(cfg)
-    if extra_config:
-        init_config.update(extra_config)
-    return wandb.init(
-        project=cfg.wandb_project,
-        entity=cfg.wandb_entity,
-        name=cfg.wandb_run_name,
-        tags=cfg.wandb_tags or None,
-        config=init_config,
-        reinit=True,
-    )
 
 
 def train_lm(
@@ -526,14 +750,29 @@ def train_lm(
     cfg: LLMConfig,
     log_fn=print,
     wandb_run=None,
+    *,
+    eval_corpus: "TokenizedCorpus | None" = None,
+    flores_corpus: "TokenizedCorpus | None" = None,
+    checkpoint_dir: "Path | None" = None,
+    artifact_name: "str | None" = None,
+    run_timestamp: "str | None" = None,
+    vocab_size: "int | None" = None,
 ):
     """Train a GPT on tokenized ``train_corpus_path`` for cfg.train_tokens tokens.
 
     Returns the trained model + the device + the autocast dtype + train wall time.
     Logs per-step ``train/loss`` and ``train/lr`` to ``wandb_run`` if provided.
     """
-    # Always use the HuggingFace Trainer path.
-    return train_lm_transformers(tokenizer, train_corpus_path, cfg, log_fn=log_fn, wandb_run=wandb_run)
+    return train_lm_transformers(
+        tokenizer, train_corpus_path, cfg,
+        log_fn=log_fn, wandb_run=wandb_run,
+        eval_corpus=eval_corpus,
+        flores_corpus=flores_corpus,
+        checkpoint_dir=checkpoint_dir,
+        artifact_name=artifact_name,
+        run_timestamp=run_timestamp,
+        vocab_size=vocab_size,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -640,28 +879,8 @@ def evaluate_perplexity_on_sentences(
     so the windowed scoring sees a continuous stream — one FLORES sentence is
     too short to fill a 512-token context on its own.
     """
-    import numpy as np
-
-    cleaned = [s.strip() for s in sentences if s and s.strip()]
-    if not cleaned:
-        raise RuntimeError(f"No non-empty sentences in '{label}' eval set.")
     eos_id = resolve_eos_id(tokenizer)
-    all_ids: list[int] = []
-    for sentence in cleaned:
-        s_ids = tokenizer.encode(sentence)
-        if not s_ids:
-            continue
-        all_ids.extend(s_ids)
-        if eos_id is not None:
-            all_ids.append(eos_id)
-    if not all_ids:
-        raise RuntimeError(f"Tokenizer produced 0 ids for '{label}' eval text.")
-    joined = " ".join(cleaned)
-    corpus = TokenizedCorpus(
-        ids=np.asarray(all_ids, dtype=np.int32),
-        rows=len(cleaned),
-        source_bytes=len(joined.encode("utf-8")),
-    )
+    corpus = _tokenize_sentences_to_corpus(tokenizer, sentences, eos_id)
     log_fn(
         f"  eval ({label}): {corpus.n_tokens:,} tokens, "
         f"{corpus.rows:,} rows, "
@@ -718,12 +937,15 @@ def load_flores_devtest(language: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Top-level: train + eval one tokenizer
+# W&B artifact helpers
 # ---------------------------------------------------------------------------
 
 
 def _log_tokenizer_artifact(wandb_run, tokenizer_artifact_dir: Path, name: str) -> None:
-    """Upload the tokenizer artifact directory as a W&B Artifact (type=tokenizer)."""
+    """Upload the tokenizer artifact directory as a W&B Artifact (type=tokenizer).
+
+    Raises on failure — callers must not silently swallow this.
+    """
     import wandb
 
     art = wandb.Artifact(name=name, type="tokenizer")
@@ -731,26 +953,76 @@ def _log_tokenizer_artifact(wandb_run, tokenizer_artifact_dir: Path, name: str) 
     wandb_run.log_artifact(art)
 
 
-def _log_model_artifact(wandb_run, model, cfg: LLMConfig, vocab_size: int, name: str) -> None:
-    """Save the trained model state_dict + config to a W&B Artifact (type=model)."""
-    import tempfile
+def _log_model_artifact(
+    wandb_run,
+    model,
+    cfg: LLMConfig,
+    vocab_size: int,
+    name: str,
+    path: Path,
+) -> None:
+    """Save the final model state_dict + config to *path* and upload to W&B.
 
-    import torch
+    *path* must be a persistent location (not a temp dir) — W&B reads the file
+    asynchronously after this function returns.  Raises on any failure.
+    """
     import wandb
 
-    art = wandb.Artifact(name=name, type="model", metadata={"vocab_size": vocab_size, **asdict(cfg)})
-    with tempfile.TemporaryDirectory() as tmp:
-        ckpt_path = Path(tmp) / "model.pt"
-        torch.save(
-            {
-                "state_dict": model.state_dict(),
-                "vocab_size": vocab_size,
-                "config": asdict(cfg),
-            },
-            ckpt_path,
-        )
-        art.add_file(str(ckpt_path), name="model.pt")
-        wandb_run.log_artifact(art)
+    _save_checkpoint_to_path(model, cfg, vocab_size, path)
+    art = wandb.Artifact(
+        name=name,
+        type="model",
+        metadata={"vocab_size": vocab_size, "step": "final", **asdict(cfg)},
+    )
+    art.add_file(str(path), name="final.pt")
+    wandb_run.log_artifact(art)
+
+
+def _define_wandb_metrics(wandb_run) -> None:
+    """Register metric definitions so W&B knows which x-axes to use.
+
+    All train/* and eval/* metrics use the global training step as their
+    primary x-axis.  In the W&B UI you can create additional custom panels
+    using train/flops or train/wall_time_s as x-axes to get the BPB-vs-compute
+    and BPB-vs-time curves.
+    """
+    import wandb
+
+    wandb.define_metric("train/step")
+    wandb.define_metric("train/*", step_metric="train/step")
+    wandb.define_metric("eval/*", step_metric="train/step")
+
+
+# ---------------------------------------------------------------------------
+# W&B run init
+# ---------------------------------------------------------------------------
+
+
+def _init_wandb(cfg: LLMConfig, extra_config: dict | None = None):
+    """Start a wandb run if cfg.wandb_project is set; otherwise return None."""
+    if not cfg.wandb_project:
+        return None
+    _ensure_wandb_login()
+    import wandb
+
+    init_config = asdict(cfg)
+    if extra_config:
+        init_config.update(extra_config)
+    run = wandb.init(
+        project=cfg.wandb_project,
+        entity=cfg.wandb_entity,
+        name=cfg.wandb_run_name,
+        tags=cfg.wandb_tags or None,
+        config=init_config,
+        reinit=True,
+    )
+    _define_wandb_metrics(run)
+    return run
+
+
+# ---------------------------------------------------------------------------
+# Top-level: train + eval one tokenizer
+# ---------------------------------------------------------------------------
 
 
 def train_and_evaluate(
@@ -773,53 +1045,109 @@ def train_and_evaluate(
     Returns metrics with ``test_*`` and ``flores_*`` keys (the latter only if
     FLORES eval ran). If ``cfg.wandb_project`` is set, a W&B run is opened
     around the train+eval loop and final metrics are logged to its summary.
-    When ``tokenizer_artifact_dir`` is provided and ``cfg.wandb_log_*_artifact``
-    is on, the tokenizer dir is uploaded as a W&B artifact at the start of the
-    run and the trained model state_dict at the end.
+
+    Artifact naming
+    ---------------
+    Tokenizer  → ``{artifact_name}-tok``   (stable; same tokenizer every run)
+    Model      → ``{artifact_name}-{run_timestamp}``  (unique per training run)
+
+    Checkpoint uploads raise on failure so errors are never silently lost.
     """
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = artifact_name or "model"
+    tokenizer_art_name = f"{base_name}-tok"
+    model_art_name = f"{base_name}-{run_timestamp}"
+
+    # Set up a persistent checkpoint directory alongside the tokenizer artifact.
+    checkpoint_dir: Path | None = None
+    if cfg.n_mid_evals > 0:
+        if tokenizer_artifact_dir is not None:
+            checkpoint_dir = Path(tokenizer_artifact_dir) / "checkpoints" / run_timestamp
+        else:
+            checkpoint_dir = Path("artifacts") / "checkpoints" / base_name / run_timestamp
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        log_fn(f"  checkpoints → {checkpoint_dir}")
+
+    # Pre-tokenize eval corpus once so both mid-training callbacks and the
+    # final post-training eval reuse the same token stream.
+    eos_id = resolve_eos_id(tokenizer)
+    eval_tc = tokenize_corpus(tokenizer, eval_corpus_path, max_tokens=None, eos_id=eos_id)
+    log_fn(
+        f"  eval corpus: {eval_tc.n_tokens:,} tokens, "
+        f"{eval_tc.rows:,} rows, "
+        f"{eval_tc.source_bytes:,} bytes "
+        f"({eval_tc.bytes_per_row:.1f} bytes/row)"
+    )
+
+    # Pre-load and pre-tokenize FLORES so the training callback doesn't hit the
+    # network mid-run and every eval step reuses the same tokenized object.
+    flores_tc: TokenizedCorpus | None = None
+    if eval_flores and language is not None and language in FLORES_CONFIGS:
+        try:
+            flores_sents = load_flores_devtest(language)
+            flores_tc = _tokenize_sentences_to_corpus(tokenizer, flores_sents, eos_id)
+            log_fn(
+                f"  flores corpus ({FLORES_CONFIGS[language]}): "
+                f"{flores_tc.n_tokens:,} tokens, {flores_tc.rows:,} rows"
+            )
+        except Exception as exc:
+            import traceback as _tb
+            log_fn(f"  FLORES pre-load failed for {language!r} (will skip): {exc}")
+            log_fn(_tb.format_exc())
+
     wandb_run = _init_wandb(cfg, extra_config=wandb_extra_config)
     try:
-        # Upload tokenizer artifact (small) up-front so it's available even
-        # if training crashes mid-way.
+        # Upload tokenizer artifact up-front so it's available even if training
+        # crashes mid-way.  Use a stable "-tok" suffix to avoid name collisions
+        # with the model artifact.
         if (
             wandb_run is not None
             and cfg.wandb_log_tokenizer_artifact
             and tokenizer_artifact_dir is not None
             and Path(tokenizer_artifact_dir).is_dir()
         ):
-            try:
-                _log_tokenizer_artifact(
-                    wandb_run,
-                    Path(tokenizer_artifact_dir),
-                    name=artifact_name or Path(tokenizer_artifact_dir).name,
-                )
-                log_fn("  uploaded tokenizer artifact to W&B")
-            except Exception as exc:
-                log_fn(f"  W&B tokenizer artifact upload failed (continuing): {exc}")
+            _log_tokenizer_artifact(
+                wandb_run,
+                Path(tokenizer_artifact_dir),
+                name=tokenizer_art_name,
+            )
+            log_fn(f"  uploaded tokenizer artifact to W&B as '{tokenizer_art_name}'")
 
         model, device, amp_dtype, train_seconds, train_corpus = train_lm(
-            tokenizer, train_corpus_path, cfg, log_fn=log_fn, wandb_run=wandb_run,
+            tokenizer, train_corpus_path, cfg,
+            log_fn=log_fn,
+            wandb_run=wandb_run,
+            eval_corpus=eval_tc,
+            flores_corpus=flores_tc,
+            checkpoint_dir=checkpoint_dir,
+            artifact_name=model_art_name,
+            run_timestamp=run_timestamp,
+            vocab_size=tokenizer.vocab_size,
         )
 
+        # Final eval — reuse the pre-tokenized corpora.
         out: dict = {}
-        test_metrics = evaluate_perplexity(
-            model, tokenizer, eval_corpus_path, cfg, device, amp_dtype, log_fn=log_fn,
+
+        log_fn(
+            f"  final eval (test set): {eval_tc.n_tokens:,} tokens, "
+            f"{eval_tc.rows:,} rows, {eval_tc.source_bytes:,} bytes"
         )
+        test_metrics = _score_corpus(model, eval_tc, cfg, device, amp_dtype)
         for k, v in test_metrics.items():
             out[f"test_{k}"] = v
 
-        if eval_flores and language is not None:
+        if flores_tc is not None:
+            log_fn(
+                f"  final eval (flores/{FLORES_CONFIGS.get(language, '?')}): "
+                f"{flores_tc.n_tokens:,} tokens, {flores_tc.rows:,} rows"
+            )
             try:
-                flores_sents = load_flores_devtest(language)
-                flores_metrics = evaluate_perplexity_on_sentences(
-                    model, tokenizer, flores_sents, cfg, device, amp_dtype,
-                    label=f"flores/{FLORES_CONFIGS[language]}", log_fn=log_fn,
-                )
+                flores_metrics = _score_corpus(model, flores_tc, cfg, device, amp_dtype)
                 for k, v in flores_metrics.items():
                     out[f"flores_{k}"] = v
             except Exception as exc:
                 import traceback as _tb
-                log_fn(f"  FLORES eval skipped for {language!r}: {exc}")
+                log_fn(f"  final FLORES eval failed: {exc}")
                 log_fn(_tb.format_exc())
 
         # Training-corpus stats (rows + bytes/row, the sanity-check indicator).
@@ -838,21 +1166,23 @@ def train_and_evaluate(
                 if isinstance(v, (int, float)):
                     wandb_run.summary[k] = v
 
-        # Upload model checkpoint after eval so its metadata is final.
+        # Upload final model checkpoint.  Uses the same artifact name as
+        # mid-training checkpoints so W&B versions them together (final.pt
+        # appears as the last version).  Raises on failure — no silent loss.
         if wandb_run is not None and cfg.wandb_log_model_artifact:
-            try:
-                _log_model_artifact(
-                    wandb_run, model, cfg,
-                    vocab_size=tokenizer.vocab_size,
-                    name=artifact_name or "model",
-                )
-                log_fn("  uploaded model artifact to W&B")
-            except Exception as exc:
-                log_fn(f"  W&B model artifact upload failed (continuing): {exc}")
+            final_ckpt_path = (
+                checkpoint_dir / "final.pt"
+                if checkpoint_dir is not None
+                else Path("artifacts") / "checkpoints" / base_name / run_timestamp / "final.pt"
+            )
+            _log_model_artifact(
+                wandb_run, model, cfg,
+                vocab_size=tokenizer.vocab_size,
+                name=model_art_name,
+                path=final_ckpt_path,
+            )
+            log_fn(f"  uploaded final model artifact to W&B as '{model_art_name}'")
 
-        # Explicitly release the model from GPU before returning so that the
-        # next run starts with a clean slate (Python GC alone won't flush the
-        # CUDA allocator cache).
         import gc
         del model
         gc.collect()
