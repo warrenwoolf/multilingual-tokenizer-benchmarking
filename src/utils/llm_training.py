@@ -636,20 +636,27 @@ def evaluate_perplexity_on_sentences(
     """Score a list of sentences (e.g. FLORES devtest) under ``model``.
 
     Each sentence counts as one row for the bytes-per-row indicator.
-    Sentences are joined with a single space separator and tokenized as one
-    continuous stream, so BPB's denominator (``source_bytes``) exactly matches
-    the byte content the loss is computed over — no EOS injection, no
-    inter-sentence bytes that weren't tokenized.
+    Sentences are concatenated with a single space separator before tokenizing,
+    so the windowed scoring sees a continuous stream — one FLORES sentence is
+    too short to fill a 512-token context on its own.
     """
     import numpy as np
 
     cleaned = [s.strip() for s in sentences if s and s.strip()]
     if not cleaned:
         raise RuntimeError(f"No non-empty sentences in '{label}' eval set.")
-    joined = " ".join(cleaned)
-    all_ids = tokenizer.encode(joined)
+    eos_id = resolve_eos_id(tokenizer)
+    all_ids: list[int] = []
+    for sentence in cleaned:
+        s_ids = tokenizer.encode(sentence)
+        if not s_ids:
+            continue
+        all_ids.extend(s_ids)
+        if eos_id is not None:
+            all_ids.append(eos_id)
     if not all_ids:
         raise RuntimeError(f"Tokenizer produced 0 ids for '{label}' eval text.")
+    joined = " ".join(cleaned)
     corpus = TokenizedCorpus(
         ids=np.asarray(all_ids, dtype=np.int32),
         rows=len(cleaned),
