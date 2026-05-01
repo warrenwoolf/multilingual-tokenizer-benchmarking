@@ -360,31 +360,27 @@ def tokenize_corpus(
 def _tokenize_sentences_to_corpus(
     tokenizer,
     sentences: list[str],
-    eos_id: int | None,
+    eos_id: int | None,  # unused; kept for call-site compatibility
 ) -> TokenizedCorpus:
     """Tokenize a list of sentences into a single ``TokenizedCorpus``.
 
-    Mirrors the encoding logic in ``evaluate_perplexity_on_sentences`` so that
-    pre-tokenized corpora passed to the training loop produce identical scores.
-    Source bytes are measured on the space-joined text (one separator per
-    inter-sentence gap), matching the original scorer.
+    Sentences are joined with a single space and tokenized as one continuous
+    stream. This keeps source_bytes exactly equal to the bytes of text that the
+    model scores, so BPB's denominator is correct. Per-sentence EOS injection
+    is intentionally omitted: the mismatch between EOS tokens in the numerator
+    and no corresponding bytes in the denominator would inflate BPB for
+    high-fertility tokenizers (which have more total tokens, so EOS predictions
+    are a smaller fraction of the loss, skewing intra-language comparisons).
     """
     import numpy as np
 
     cleaned = [s.strip() for s in sentences if s and s.strip()]
     if not cleaned:
         raise RuntimeError("No non-empty sentences to tokenize.")
-    all_ids: list[int] = []
-    for sentence in cleaned:
-        s_ids = tokenizer.encode(sentence)
-        if not s_ids:
-            continue
-        all_ids.extend(s_ids)
-        if eos_id is not None:
-            all_ids.append(eos_id)
+    joined = " ".join(cleaned)
+    all_ids = tokenizer.encode(joined)
     if not all_ids:
         raise RuntimeError("Tokenizer produced 0 ids for sentence list.")
-    joined = " ".join(cleaned)
     return TokenizedCorpus(
         ids=np.asarray(all_ids, dtype=np.int32),
         rows=len(cleaned),
