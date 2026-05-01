@@ -281,7 +281,7 @@ def test_train_lm_passes_eos_id(monkeypatch, tmp_path):
     assert calls["eos_id"] == 3
 
 
-def test_flores_sentence_eval_uses_joined_bytes_and_eos(monkeypatch):
+def test_flores_sentence_eval_tokenizes_joined_text(monkeypatch):
     captured = {}
 
     class Tok:
@@ -310,12 +310,15 @@ def test_flores_sentence_eval_uses_joined_bytes_and_eos(monkeypatch):
         log_fn=lambda *a, **k: None,
     )
 
-    # "ab cd" includes one inserted separator byte.
-    assert captured["source_bytes"] == len("ab cd".encode("utf-8"))
+    # BPB denominator must equal the bytes of exactly the text that was
+    # tokenized — the joined string, no EOS injection.
+    joined = "ab cd"
+    assert captured["source_bytes"] == len(joined.encode("utf-8"))
     assert captured["rows"] == 2
-    # eos id appended after each sentence.
-    assert captured["ids"][2] == 9
-    assert captured["ids"][-1] == 9
+    # Token stream is the joined text encoded as one piece (no EOS markers
+    # interleaved between sentences).
+    assert captured["ids"] == [ord(c) % 17 for c in joined]
+    assert 9 not in captured["ids"]
 
 
 def test_train_all_llms_skips_completed_rows(monkeypatch, tmp_path):
